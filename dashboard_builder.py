@@ -329,7 +329,7 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
 
     last_col_letter = get_column_letter(ncols)
     cache = CacheDefinition(
-        refreshOnLoad=True, saveData=True, recordCount=n,
+        refreshOnLoad=False, saveData=True, recordCount=n,
         createdVersion=8, refreshedVersion=8, minRefreshableVersion=3,
         cacheSource=CacheSource(type='worksheet',
                                  worksheetSource=WorksheetSource(ref=f'A1:{last_col_letter}{n + 1}', sheet='Data')),
