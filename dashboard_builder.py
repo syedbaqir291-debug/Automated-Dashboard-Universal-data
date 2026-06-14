@@ -525,6 +525,7 @@ def _build_dashboard(ws, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots
 
     # ---------------- Charts ----------------
     anchor_cols = ['A', 'J', 'S']
+    anchor_cols_idx = [1, 10, 19]
     anchor_rows = [10, 28, 46, 64, 82, 100]
     for i, d in enumerate(dims):
         h, g, n_items, idx, name, _ = pivot_layout[d]
@@ -564,9 +565,65 @@ def _build_dashboard(ws, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots
 
         ws.add_chart(chart, anchor)
 
+    # ---------------- Full category breakdown (every category, not just top-N) ----------------
+    n_chart_rows = max(1, -(-len(dims) // 3))
+    section_header_row = anchor_rows[n_chart_rows - 1] + 22
+    ws.merge_cells(f'A{section_header_row}:{last_col_letter}{section_header_row}')
+    note = ws.cell(row=section_header_row, column=1)
+    note.value = ('\u25bc  Full category breakdown \u2014 every category for each dimension '
+                   '(the charts above show the top categories only).')
+    note.font = Font(name='Calibri', size=10, italic=True, color=NAVY)
+    note.alignment = Alignment(horizontal='left', vertical='center')
+    ws.row_dimensions[section_header_row].height = 20
+    for cell in ws[f'A{section_header_row}:{last_col_letter}{section_header_row}'][0]:
+        cell.fill = PatternFill('solid', start_color=LIGHT)
+
+    table_thin = Side(style='thin', color='C9D6D6')
+    table_border = Border(left=table_thin, right=table_thin, top=table_thin, bottom=table_thin)
+
+    group_start = section_header_row + 2
+    for row_idx in range(n_chart_rows):
+        group_dims = dims[row_idx * 3:(row_idx + 1) * 3]
+        max_height = 0
+        for col_idx, d in enumerate(group_dims):
+            h, g, n_items, idx, name, _ = pivot_layout[d]
+            c0 = anchor_cols_idx[col_idx]
+            c1 = c0 + 1
+            cap = ws.cell(row=group_start, column=c0, value=d)
+            cap.font = Font(name='Calibri', size=11, bold=True, color=NAVY)
+            hdr1 = ws.cell(row=group_start + 1, column=c0, value=f"='PivotTables'!A{h}")
+            hdr2 = ws.cell(row=group_start + 1, column=c1, value=f"='PivotTables'!B{h}")
+            for cell in (hdr1, hdr2):
+                cell.font = Font(name='Calibri', size=10, bold=True, color='FFFFFF')
+                cell.fill = PatternFill('solid', start_color=TEAL)
+                cell.border = table_border
+            for k in range(n_items):
+                r = group_start + 2 + k
+                lc = ws.cell(row=r, column=c0, value=f"='PivotTables'!A{h + 1 + k}")
+                vc = ws.cell(row=r, column=c1, value=f"='PivotTables'!B{h + 1 + k}")
+                lc.border = table_border
+                vc.border = table_border
+                vc.number_format = numfmt
+                if k % 2 == 1:
+                    lc.fill = PatternFill('solid', start_color=LIGHT)
+                    vc.fill = PatternFill('solid', start_color=LIGHT)
+            gr = group_start + 2 + n_items
+            glc = ws.cell(row=gr, column=c0, value='Total')
+            gvc = ws.cell(row=gr, column=c1, value=f"='PivotTables'!B{g}")
+            for cell in (glc, gvc):
+                cell.font = Font(name='Calibri', bold=True)
+                cell.border = table_border
+                cell.fill = PatternFill('solid', start_color='FFFFFF')
+            gvc.number_format = numfmt
+            max_height = max(max_height, n_items + 3)
+        group_start += max_height + 2
+
     # ---------------- Column widths / row heights ----------------
     for col in range(1, n_cols_layout + 1):
         ws.column_dimensions[get_column_letter(col)].width = 8.5
+    for c0 in anchor_cols_idx:
+        ws.column_dimensions[get_column_letter(c0)].width = 26
+        ws.column_dimensions[get_column_letter(c0 + 1)].width = 13
     ws.row_dimensions[1].height = 28
     ws.row_dimensions[2].height = 28
     ws.row_dimensions[3].height = 18
