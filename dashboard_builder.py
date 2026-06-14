@@ -3,20 +3,24 @@ dashboard_builder.py
 Generic "upload any data -> native PivotTable dashboard" engine.
 
 Builds an .xlsx with:
-  - Data        : cleaned source as an Excel Table
-  - PivotData   : hidden sheet holding N native PivotTables (1 per chosen
-                  dimension), all sharing ONE PivotCache so a single set of
-                  slicers (added by the user in Excel) can cross-filter
-                  every pivot + every chart + every KPI card at once.
-  - Dashboard   : title, KPI cards (formulas reading PivotData cells), and
-                  one chart per dimension.
+  - Dashboard : title (+ OMAC Developers capsule), KPI cards (formulas
+                reading PivotTable cells), one chart per dimension, and
+                the live native PivotTables themselves stacked below the
+                charts (so the file visibly contains real, interactive
+                pivots the moment it's opened).
+  - Data      : cleaned source as an Excel Table (the PivotCache source)
+
+All PivotTables share ONE PivotCache, so a single set of Slicers (added
+by the user in Excel - see README) cross-filters every pivot, chart and
+KPI card at once.
 """
 
+import re
 import numpy as np
 import pandas as pd
 from io import BytesIO
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -41,6 +45,7 @@ TEAL = '2E8B8B'
 LIGHT = 'EAF2F2'
 ACCENT = 'C0392B'
 GREY = '95A5A6'
+GOLD = 'D4AC0D'
 PALETTE = [TEAL, NAVY, ACCENT, 'E67E22', 'F1C40F', '27AE60', '8E44AD', '34495E']
 
 RECORD_COL = '__Records__'
@@ -49,6 +54,8 @@ BLANK = '(Blank)'
 MAX_DIMENSIONS = 8
 MAX_CHART_CATEGORIES = 10
 DONUT_THRESHOLD = 5  # <= this many categories -> donut, else bar
+
+BRAND = 'OMAC Developers \u00b7 S M Baqir'
 
 
 # ---------------------------------------------------------------------
@@ -60,13 +67,26 @@ def load_dataframe(file_obj, filename):
     return pd.read_excel(file_obj)
 
 
+def _norm_text(v):
+    if not isinstance(v, str):
+        return v
+    v = v.replace('\n', ' ').replace('\r', ' ')
+    v = ' '.join(v.split())
+    return v
+
+
 def clean_dataframe(df):
+    """Clean headers AND normalize whitespace/newlines inside text cells.
+
+    This is the generic fix for categories silently splitting into
+    near-duplicates (e.g. "Finance\\n" vs "Finance " vs "Finance  Dept")
+    which otherwise fragments PivotTable groupings.
+    """
     df = df.copy()
     cols = []
     seen = {}
     for c in df.columns:
-        c2 = str(c).strip().replace('\n', ' ')
-        c2 = ' '.join(c2.split())
+        c2 = _norm_text(str(c))
         if not c2 or c2.lower().startswith('unnamed'):
             c2 = 'Column'
         if c2 in seen:
@@ -76,6 +96,11 @@ def clean_dataframe(df):
             seen[c2] = 0
         cols.append(c2)
     df.columns = cols
+
+    for col in df.columns:
+        if df[col].dtype == object or pd.api.types.is_string_dtype(df[col]):
+            df[col] = df[col].map(_norm_text)
+
     return df
 
 
@@ -90,7 +115,7 @@ def profile_columns(df):
         s = df[col]
         nunique = s.nunique(dropna=True)
         fill_rate = s.notna().sum() / n if n else 0
-        looks_like_id_name = bool(__import__('re').search(id_pattern, col.lower()))
+        looks_like_id_name = bool(re.search(id_pattern, col.lower()))
         looks_like_id_vals = nunique == n and n > 10
 
         if pd.api.types.is_numeric_dtype(s):
@@ -112,9 +137,9 @@ def profile_columns(df):
         if s.dtype == object or pd.api.types.is_string_dtype(s):
             sample = s.dropna().astype(str)
             if len(sample):
-                dt_re = __import__('re').compile(
+                dt_re = re.compile(
                     r'\d{1,2}\s*(?:am|pm)|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|'
-                    r'\d{1,2}[-\s](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', __import__('re').I)
+                    r'\d{1,2}[-\s](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', re.I)
                 match_frac = sample.str.contains(dt_re).mean()
                 looks_like_datetime_vals = match_frac > 0.3
 
@@ -138,7 +163,7 @@ def profile_columns(df):
 
 
 # ---------------------------------------------------------------------
-# Step 2 - build the workbook
+# Step 2 - pivot table helpers
 # ---------------------------------------------------------------------
 def _make_pivot_fields(ncols, row_field_idx, n_items):
     pfs = []
@@ -185,6 +210,9 @@ def _style_title(chart, text):
         pass
 
 
+# ---------------------------------------------------------------------
+# Step 3 - build the workbook
+# ---------------------------------------------------------------------
 def build_workbook(df, dims, measure_mode, measure_col=None,
                     title='Auto-Generated Dashboard', source_label=''):
     """
@@ -206,7 +234,6 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
     headers = list(df.columns)
     ncols = len(headers)
 
-    # Replace NaNs in dimension columns with a visible placeholder
     for d in dims:
         df[d] = df[d].apply(lambda v: BLANK if pd.isna(v) else str(v))
 
@@ -285,21 +312,27 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
     )
     cache.records = RecordList(r=records)
 
-    # -------- build pivot tables (1 per dimension, side by side) --------
+    # -------- layout: figure out where pivot tables live on Dashboard --------
+    n_dims = len(dims)
+    n_chart_rows = max(1, -(-n_dims // 3))  # ceil
+    chart_anchor_rows = [10, 28, 46, 64, 82, 100]
+    pivot_start_row = chart_anchor_rows[min(n_chart_rows, len(chart_anchor_rows)) - 1] + 24
+
     pivots = {}
-    pivot_refs = {}  # name -> (c0, c1, row0, n_items, fld_idx, caption)
-    col_cursor = 1
+    pivot_layout = {}  # dim -> (header_row, grand_row, n_items, fld_idx, name, caption_row)
+    running_row = pivot_start_row
     for d in dims:
         idx = headers.index(d)
         n_items = len(CAT_FIELDS[idx])
         name = f'PT_{idx}_{d}'.replace(' ', '_')
         name = ''.join(ch for ch in name if ch.isalnum() or ch == '_')[:31]
-        c0, c1 = col_cursor, col_cursor + 1
-        ref = f'{get_column_letter(c0)}1:{get_column_letter(c1)}{2 + n_items}'
+        header_row = running_row + 1
+        grand_row = header_row + 1 + n_items
+        ref = f'A{header_row}:B{grand_row}'
         pivots[name] = _make_pivot(name, ncols, idx, n_items, ref, cache,
                                     measure_idx, subtotal, measure_label, d)
-        pivot_refs[name] = (c0, c1, 1, n_items, idx, d)
-        col_cursor += 3  # 2 data cols + 1 gap
+        pivot_layout[d] = (header_row, grand_row, n_items, idx, name, running_row)
+        running_row = grand_row + 2
 
     # -------- workbook --------
     wb = Workbook()
@@ -309,17 +342,10 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
     header_fill = PatternFill('solid', start_color=NAVY)
     header_font = Font(bold=True, color='FFFFFF', name='Calibri')
     for j, h in enumerate(headers, start=1):
-        if h == RECORD_COL:
-            continue
         c = ws_data.cell(row=1, column=j, value=h)
         c.fill = header_fill
         c.font = header_font
         c.alignment = Alignment(wrap_text=True, vertical='center')
-    # hidden helper column header (still needs a header cell for the Table)
-    rc_idx = headers.index(RECORD_COL) + 1
-    c = ws_data.cell(row=1, column=rc_idx, value=RECORD_COL)
-    c.fill = header_fill
-    c.font = header_font
 
     for i, (_, row) in enumerate(df.iterrows(), start=2):
         for j, h in enumerate(headers, start=1):
@@ -342,37 +368,16 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
     ws_data.freeze_panes = 'A2'
     for j, h in enumerate(headers, start=1):
         ws_data.column_dimensions[get_column_letter(j)].width = 22 if len(h) > 14 else 14
+    rc_idx = headers.index(RECORD_COL) + 1
     ws_data.column_dimensions[get_column_letter(rc_idx)].hidden = True
-
-    # ---- PivotData sheet (hidden) ----
-    ws_pv = wb.create_sheet('PivotData')
-    ws_pv.sheet_state = 'hidden'
-    for name, (c0, c1, row0, n_items, fld_idx, cap) in pivot_refs.items():
-        order = CAT_FIELDS[fld_idx]
-        d = headers[fld_idx]
-        agg = sort_fn(d).fillna(0)
-        ws_pv.cell(row=row0, column=c0, value=cap)
-        ws_pv.cell(row=row0, column=c1, value=measure_label)
-        total = 0.0
-        for k, val in enumerate(order):
-            v = float(agg.get(val, 0))
-            total += v if subtotal != 'average' else 0
-            ws_pv.cell(row=row0 + 1 + k, column=c0, value=val)
-            ws_pv.cell(row=row0 + 1 + k, column=c1, value=v)
-        grand = float(agg.sum()) if subtotal == 'sum' else (
-            float(df[measure_col].mean()) if subtotal == 'average' else float(n))
-        if subtotal == 'count':
-            grand = float(sum(agg.get(v, 0) for v in order))
-        ws_pv.cell(row=row0 + 1 + n_items, column=c0, value='Grand Total')
-        ws_pv.cell(row=row0 + 1 + n_items, column=c1, value=grand)
-        ws_pv.add_pivot(pivots[name])
 
     # ---- Dashboard sheet ----
     ws_dash = wb.create_sheet('Dashboard', 0)
-    _build_dashboard(ws_dash, dims, headers, CAT_FIELDS, pivot_refs,
-                      measure_mode, measure_col, measure_label, numfmt, title, source_label, n)
+    _build_dashboard(ws_dash, dims, headers, CAT_FIELDS, pivot_layout, pivots,
+                      measure_mode, measure_col, measure_label, numfmt, title, source_label, n,
+                      pivot_start_row)
 
-    wb._sheets = [wb['Dashboard'], wb['Data'], wb['PivotData']]
+    wb._sheets = [wb['Dashboard'], wb['Data']]
     wb.active = 0
 
     out = BytesIO()
@@ -381,7 +386,6 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
 
     # Round-trip through openpyxl once: this consolidates the pivot cache
     # into a single shared definition (avoids duplicate pivotCache parts).
-    from openpyxl import load_workbook
     wb2 = load_workbook(out)
     out2 = BytesIO()
     wb2.save(out2)
@@ -390,10 +394,11 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
 
 
 # ---------------------------------------------------------------------
-# Step 3 - Dashboard sheet (KPI cards + charts)
+# Step 4 - Dashboard sheet (branding + KPI cards + charts + live pivots)
 # ---------------------------------------------------------------------
-def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_refs,
-                       measure_mode, measure_col, measure_label, numfmt, title, source_label, n):
+def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_layout, pivots,
+                       measure_mode, measure_col, measure_label, numfmt, title, source_label, n,
+                       pivot_start_row):
     ws.sheet_view.showGridLines = False
     ws.sheet_view.zoomScale = 85
     ws.page_setup.orientation = 'landscape'
@@ -401,11 +406,11 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_refs,
     ws.page_setup.fitToHeight = 0
 
     n_dims = len(dims)
-    n_cols_layout = max(24, n_dims and ((min(n_dims, 6) * 3) or 18), 18)
-
-    # Title band
+    n_cols_layout = max(24, (min(n_dims, 6) * 3) or 18)
     last_col_letter = get_column_letter(n_cols_layout)
-    ws.merge_cells(f'A1:{last_col_letter}2')
+
+    # ---------------- Title band ----------------
+    ws.merge_cells(f'A1:{get_column_letter(n_cols_layout - 6)}2')
     c = ws['A1']
     c.value = title
     c.font = Font(name='Calibri', size=22, bold=True, color='FFFFFF')
@@ -413,6 +418,20 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_refs,
     for row in ws[f'A1:{last_col_letter}2']:
         for cell in row:
             cell.fill = PatternFill('solid', start_color=NAVY)
+
+    # OMAC branding capsule, top-right of the title band
+    badge_c0 = n_cols_layout - 5
+    ws.merge_cells(start_row=1, start_column=badge_c0, end_row=1, end_column=n_cols_layout)
+    b = ws.cell(row=1, column=badge_c0)
+    b.value = BRAND
+    b.font = Font(name='Calibri', size=10, bold=True, color=NAVY)
+    b.fill = PatternFill('solid', start_color=GOLD)
+    b.alignment = Alignment(horizontal='center', vertical='center')
+    ws.merge_cells(start_row=2, start_column=badge_c0, end_row=2, end_column=n_cols_layout)
+    b2 = ws.cell(row=2, column=badge_c0)
+    b2.value = 'Auto Pivot Dashboard'
+    b2.font = Font(name='Calibri', size=8, italic=True, color='FFFFFF')
+    b2.alignment = Alignment(horizontal='center', vertical='center')
 
     ws.merge_cells(f'A3:{last_col_letter}3')
     c = ws['A3']
@@ -424,14 +443,6 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_refs,
     c.alignment = Alignment(horizontal='left', vertical='center', indent=1)
 
     # ---------------- KPI cards ----------------
-    # ordered by name -> recover pivot order matching `dims`
-    ordered = []
-    for d in dims:
-        for name, (c0, c1, row0, n_items, fld_idx, cap) in pivot_refs.items():
-            if cap == d:
-                ordered.append((d, c0, c1, n_items))
-                break
-
     if measure_mode == 'count':
         kpi1_label = 'Total Records'
     elif measure_mode == 'sum':
@@ -439,29 +450,31 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_refs,
     else:
         kpi1_label = f'Overall Average {measure_col}'
 
-    d0, c0a, c1a, n0 = ordered[0]
-    grand_addr0 = f'{get_column_letter(c1a)}{1 + 1 + n0}'
-    top_label_addr0 = f'{get_column_letter(c0a)}2'
-    top_val_addr0 = f'{get_column_letter(c1a)}2'
-    second_label_addr0 = f'{get_column_letter(c0a)}3' if n0 >= 2 else top_label_addr0
-    second_val_addr0 = f'{get_column_letter(c1a)}3' if n0 >= 2 else top_val_addr0
-    cat_count_addr0 = f'COUNTA(PivotData!{get_column_letter(c0a)}2:{get_column_letter(c0a)}{1 + n0})'
+    d0 = dims[0]
+    h0, g0, n0, idx0, name0, _ = pivot_layout[d0]
+    grand_addr0 = f'B{g0}'
+    top_label_addr0 = f'A{h0 + 1}'
+    top_val_addr0 = f'B{h0 + 1}'
+    second_label_addr0 = f'A{h0 + 2}' if n0 >= 2 else top_label_addr0
+    second_val_addr0 = f'B{h0 + 2}' if n0 >= 2 else top_val_addr0
+    cat_count_formula = f'COUNTA(A{h0 + 1}:A{h0 + n0})'
 
     kpis = [
-        (kpi1_label, f'=PivotData!{grand_addr0}', numfmt, NAVY),
-        (f'Top {d0}', f'=PivotData!{top_label_addr0}', '@', TEAL, True),
-        (f'{measure_label} ({d0} top)', f'=PivotData!{top_val_addr0}', numfmt, TEAL),
+        (kpi1_label, f'={grand_addr0}', numfmt, NAVY),
+        (f'Top {d0}', f'={top_label_addr0}', '@', TEAL, True),
+        (f'{measure_label} ({d0} top)', f'={top_val_addr0}', numfmt, TEAL),
     ]
 
-    if len(ordered) >= 2:
-        d1, c0b, c1b, n1 = ordered[1]
-        kpis.append((f'Top {d1}', f'=PivotData!{get_column_letter(c0b)}2', '@', ACCENT, True))
-        kpis.append((f'{measure_label} ({d1} top)', f'=PivotData!{get_column_letter(c1b)}2', numfmt, ACCENT))
+    if len(dims) >= 2:
+        d1 = dims[1]
+        h1, g1, n1, idx1, name1, _ = pivot_layout[d1]
+        kpis.append((f'Top {d1}', f'=A{h1 + 1}', '@', ACCENT, True))
+        kpis.append((f'{measure_label} ({d1} top)', f'=B{h1 + 1}', numfmt, ACCENT))
     else:
-        kpis.append((f'2nd Highest {d0}', f'=PivotData!{second_label_addr0}', '@', ACCENT, True))
-        kpis.append((f'{measure_label} (2nd)', f'=PivotData!{second_val_addr0}', numfmt, ACCENT))
+        kpis.append((f'2nd Highest {d0}', f'={second_label_addr0}', '@', ACCENT, True))
+        kpis.append((f'{measure_label} (2nd)', f'={second_val_addr0}', numfmt, ACCENT))
 
-    kpis.append((f'{d0} Categories', f'={cat_count_addr0}', '#,##0', GREY))
+    kpis.append((f'{d0} Categories', f'={cat_count_formula}', '#,##0', GREY))
 
     card_width = 3
     start_row = 5
@@ -494,26 +507,23 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_refs,
 
     # ---------------- Charts ----------------
     anchor_cols = ['A', 'J', 'S']
-    anchor_rows = [10, 27, 44, 61, 78, 95]
-    for i, d in enumerate(dims[:len(anchor_cols) * len(anchor_rows)]):
-        for name, (c0, c1, row0, n_items, fld_idx, cap) in pivot_refs.items():
-            if cap == d:
-                break
-        col_letter = i % len(anchor_cols)
-        row_idx = i // len(anchor_cols)
-        anchor = f'{anchor_cols[col_letter]}{anchor_rows[row_idx]}'
+    anchor_rows = [10, 28, 46, 64, 82, 100]
+    for i, d in enumerate(dims):
+        h, g, n_items, idx, name, _ = pivot_layout[d]
+        col_idx = i % 3
+        row_idx = i // 3
+        anchor = f'{anchor_cols[col_idx]}{anchor_rows[row_idx]}'
 
         if n_items <= DONUT_THRESHOLD:
             chart = DoughnutChart()
-            chart.add_data(Reference(ws.parent['PivotData'], min_col=c1, min_row=row0, max_row=row0 + n_items),
-                            titles_from_data=True)
-            chart.set_categories(Reference(ws.parent['PivotData'], min_col=c0, min_row=row0 + 1, max_row=row0 + n_items))
+            chart.add_data(Reference(ws, min_col=2, min_row=h, max_row=h + n_items), titles_from_data=True)
+            chart.set_categories(Reference(ws, min_col=1, min_row=h + 1, max_row=h + n_items))
             chart.height = 8
             chart.width = 9.5
             chart.dataLabels = DataLabelList(showVal=True, showCatName=False, showSerName=False,
                                               showPercent=False, showLegendKey=False)
             chart.holeSize = 55
-            _style_title(chart, f'{d}')
+            _style_title(chart, d)
             chart.series[0].dPt = [
                 DataPoint(idx=k, spPr=GraphicalProperties(solidFill=PALETTE[k % len(PALETTE)]))
                 for k in range(n_items)
@@ -522,9 +532,8 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_refs,
             top_n = min(n_items, MAX_CHART_CATEGORIES)
             chart = BarChart()
             chart.type = 'bar'
-            chart.add_data(Reference(ws.parent['PivotData'], min_col=c1, min_row=row0 + 1, max_row=row0 + top_n),
-                            titles_from_data=False)
-            chart.set_categories(Reference(ws.parent['PivotData'], min_col=c0, min_row=row0 + 1, max_row=row0 + top_n))
+            chart.add_data(Reference(ws, min_col=2, min_row=h + 1, max_row=h + top_n), titles_from_data=False)
+            chart.set_categories(Reference(ws, min_col=1, min_row=h + 1, max_row=h + top_n))
             chart.height = 9.5
             chart.width = 12.5
             chart.dataLabels = DataLabelList(showVal=True, showCatName=False, showSerName=False,
@@ -537,7 +546,30 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_refs,
 
         ws.add_chart(chart, anchor)
 
-    for col in range(1, n_cols_layout + 6):
+    # ---------------- Live PivotTables section ----------------
+    note_row = pivot_start_row - 2
+    ws.merge_cells(f'A{note_row}:{last_col_letter}{note_row}')
+    note = ws.cell(row=note_row, column=1)
+    note.value = ('\u25bc  Live PivotTables (the engine behind every chart and KPI above).  '
+                   'Click any cell below \u2192 Insert \u2192 Slicer to add interactive filters \u2014 '
+                   'then Report Connections \u2192 select all PivotTables to cross-filter everything on this sheet.')
+    note.font = Font(name='Calibri', size=10, italic=True, color=NAVY)
+    note.alignment = Alignment(horizontal='left', vertical='center')
+    ws.row_dimensions[note_row].height = 22
+    for cell in ws[f'A{note_row}:{last_col_letter}{note_row}'][0]:
+        cell.fill = PatternFill('solid', start_color=LIGHT)
+
+    for d in dims:
+        h, g, n_items, idx, name, caption_row = pivot_layout[d]
+        cap = ws.cell(row=caption_row, column=1)
+        cap.value = d
+        cap.font = Font(name='Calibri', size=12, bold=True, color=NAVY)
+        ws.add_pivot(pivots[name])
+
+    # ---------------- Column widths / row heights ----------------
+    ws.column_dimensions['A'].width = 28
+    ws.column_dimensions['B'].width = 16
+    for col in range(3, n_cols_layout + 1):
         ws.column_dimensions[get_column_letter(col)].width = 8.5
     ws.row_dimensions[1].height = 28
     ws.row_dimensions[2].height = 28
