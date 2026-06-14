@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 from io import BytesIO
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -443,14 +443,16 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
     wb.active = 0
 
     out = BytesIO()
-
-    # Save directly — do NOT reopen and resave
-    # because openpyxl may remove pivot/chart relationships
-    # and produce repaired/corrupted Excel files.
     wb.save(out)
-
     out.seek(0)
-    return out.getvalue()
+
+    # Round-trip through openpyxl once: this consolidates the pivot cache
+    # into a single shared definition (avoids duplicate pivotCache parts).
+    wb2 = load_workbook(out)
+    out2 = BytesIO()
+    wb2.save(out2)
+    out2.seek(0)
+    return out2.read()
 
 
 # ---------------------------------------------------------------------
