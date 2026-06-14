@@ -274,17 +274,18 @@ if generate:
 
     with st.expander("📌 One last step in Excel — adding Slicers", expanded=True):
         st.markdown(f"""
-The **Dashboard** sheet already contains real, native PivotTables (one per
-dimension you picked, stacked below the charts) sharing a single
-PivotCache — that's what makes cross-filtering possible.
+The workbook has 3 sheets: **Dashboard** (KPIs + charts), **PivotTables**
+(the real, native PivotTables — one per dimension you picked, all
+sharing a single PivotCache), and **Data** (cleaned source).
 
 To add the interactive filter buttons (Slicers):
 
-1. Click any cell inside one of the PivotTables on the Dashboard sheet.
+1. Go to the **PivotTables** sheet, click any cell inside one of the
+   PivotTables.
 2. **Insert → Slicer**, and tick the field(s) you want as filters.
 3. Right-click each slicer → **Report Connections** → tick *every*
    PivotTable listed.
-4. Drag the slicer(s) next to the charts at the top.
+4. Cut/paste the slicer(s) onto the **Dashboard** sheet next to the charts.
 
 Once connected, every chart *and* every KPI card (since they read
 PivotTable cells directly) updates together when you click a slicer.
