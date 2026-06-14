@@ -97,8 +97,9 @@ st.markdown(f"""
 <div class="omac-header">
     <div>
         <h1>📊 Auto Pivot Dashboard Generator</h1>
-        <p>Upload any data &middot; pick dimensions &amp; a measure &middot; get a workbook full of
-        native, slicer-ready PivotTables, KPI cards and charts.</p>
+        <p>Upload any data &middot; pick dimensions &amp; a measure &middot; get a polished
+        workbook with KPI cards, charts and a clean summary sheet &mdash; ready to open,
+        no Excel repair prompts.</p>
     </div>
     <div class="omac-badge">{BRAND}</div>
 </div>
@@ -157,7 +158,7 @@ if not profile['dimension_candidates']:
 st.markdown('<div class="section-card">', unsafe_allow_html=True)
 st.markdown("### 2️⃣ Choose breakdown columns (dimensions)")
 st.caption(
-    f"These become your PivotTables, charts and slicer fields. We've pre-selected good "
+    f"These become your summary tables, charts and KPI cards. We've pre-selected good "
     f"candidates — add or remove as needed (max {MAX_DIMENSIONS})."
 )
 dims = st.multiselect(
@@ -169,10 +170,31 @@ dims = st.multiselect(
 )
 st.markdown('</div>', unsafe_allow_html=True)
 
+chart_types = {}
+if dims:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown("### 🍩 Chart style per dimension")
+    st.caption(
+        "By default, dimensions with 5 or fewer categories become donut charts "
+        "and the rest become bar charts. Override any of these below — useful "
+        "for things like 'Month' where you might prefer a bar/trend view even "
+        "with few categories."
+    )
+    cols = st.columns(min(len(dims), 4))
+    for i, d in enumerate(dims):
+        with cols[i % len(cols)]:
+            choice = st.selectbox(
+                d,
+                options=["Auto", "Donut", "Bar"],
+                key=f"chart_type_{d}",
+            )
+            chart_types[d] = choice.lower()
+    st.markdown('</div>', unsafe_allow_html=True)
+
 st.markdown('<div class="section-card">', unsafe_allow_html=True)
 st.markdown("### 3️⃣ Choose the measure (dependent variable)")
 measure_mode_label = st.radio(
-    "What should each pivot/chart measure?",
+    "What should each summary table/chart measure?",
     options=["Count of records", "Sum of a numeric column", "Average of a numeric column"],
     horizontal=True,
     label_visibility="collapsed",
@@ -210,11 +232,12 @@ if not dims:
 generate = st.button("🚀 Generate Dashboard", type="primary", use_container_width=True)
 
 if generate:
-    with st.spinner("Building PivotTables, charts and KPI cards..."):
+    with st.spinner("Building summary tables, charts and KPI cards..."):
         try:
             xlsx_bytes = build_workbook(
                 df, dims, measure_mode, measure_col,
                 title=title, source_label=source_label,
+                chart_types=chart_types,
             )
         except Exception as e:
             st.error(f"Something went wrong while building the workbook: {e}")
@@ -249,7 +272,7 @@ if generate:
     k3.metric(f"{agg_label} ({d0} top)", agg_fmt.format(s0.iloc[0]))
     k4.metric(f"{d0} categories", f"{len(s0)}")
 
-    st.caption("Charts below mirror the PivotTable-driven charts in the generated workbook "
+    st.caption("Charts below mirror the charts in the generated workbook "
                "(top categories shown):")
 
     chart_cols = st.columns(3)
@@ -272,23 +295,23 @@ if generate:
         use_container_width=True,
     )
 
-    with st.expander("📌 One last step in Excel — adding Slicers", expanded=True):
-        st.markdown(f"""
-The workbook has 3 sheets: **Dashboard** (KPIs + charts), **PivotTables**
-(the real, native PivotTables — one per dimension you picked, all
-sharing a single PivotCache), and **Data** (cleaned source).
+    with st.expander("📌 About the downloaded workbook", expanded=True):
+        st.markdown("""
+The workbook has 3 sheets: **Dashboard** (KPI cards + charts), **Summary
+Data** (the per-category tables that drive every chart and KPI on the
+Dashboard), and **Data** (cleaned source as an Excel Table).
 
-To add the interactive filter buttons (Slicers):
+This file opens cleanly in Excel with no "repair" prompts. If you'd like
+to explore the raw data interactively yourself:
 
-1. Go to the **PivotTables** sheet, click any cell inside one of the
-   PivotTables.
-2. **Insert → Slicer**, and tick the field(s) you want as filters.
-3. Right-click each slicer → **Report Connections** → tick *every*
-   PivotTable listed.
-4. Cut/paste the slicer(s) onto the **Dashboard** sheet next to the charts.
+1. Go to the **Data** sheet and click anywhere inside the table.
+2. **Insert → PivotTable** and choose where to place it.
+3. Drag any field into Rows/Values to build your own pivot — Excel will
+   create a fresh, valid PivotTable from this table.
 
-Once connected, every chart *and* every KPI card (since they read
-PivotTable cells directly) updates together when you click a slicer.
+For interactive, slicer-style filtering without leaving the browser, use
+this app's own charts and KPI preview above — they update live as you
+change your dimension/measure selections.
         """)
     st.markdown('</div>', unsafe_allow_html=True)
 
