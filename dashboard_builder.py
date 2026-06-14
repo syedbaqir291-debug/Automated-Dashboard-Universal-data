@@ -523,15 +523,20 @@ def _build_dashboard(ws, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots
                 cell.border = border
                 cell.fill = PatternFill('solid', start_color=LIGHT if r == start_row else 'FFFFFF')
 
-    # ---------------- Charts ----------------
-    anchor_cols = ['A', 'J', 'S']
-    anchor_cols_idx = [1, 10, 19]
-    anchor_rows = [10, 28, 46, 64, 82, 100]
+    # ---------------- Charts: top-N chart, plus an "all categories" chart underneath ----------------
+    anchor_cols_idx = [1, 14]       # column A and N
+    ROW_CM = 0.529  # approx cm per default row height
+
+    row_cursor = 10
+    row_group_height = 0
     for i, d in enumerate(dims):
         h, g, n_items, idx, name, _ = pivot_layout[d]
-        col_idx = i % 3
-        row_idx = i // 3
-        anchor = f'{anchor_cols[col_idx]}{anchor_rows[row_idx]}'
+        col_idx = i % 2
+        if col_idx == 0 and i > 0:
+            row_cursor += row_group_height + 2
+            row_group_height = 0
+        c0 = anchor_cols_idx[col_idx]
+        anchor = f'{get_column_letter(c0)}{row_cursor}'
 
         if n_items <= DONUT_THRESHOLD:
             chart = DoughnutChart()
@@ -547,6 +552,8 @@ def _build_dashboard(ws, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots
                 DataPoint(idx=k, spPr=GraphicalProperties(solidFill=PALETTE[k % len(PALETTE)]))
                 for k in range(n_items)
             ]
+            chart_height_rows = 16
+            top_n = n_items
         else:
             top_n = min(n_items, MAX_CHART_CATEGORIES)
             chart = BarChart()
@@ -560,70 +567,41 @@ def _build_dashboard(ws, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots
             chart.series[0].graphicalProperties = GraphicalProperties(solidFill=PALETTE[i % len(PALETTE)])
             chart.y_axis.majorGridlines = None
             chart.legend = None
-            title_text = f'{d}  (top {top_n})' if n_items > top_n else d
+            title_text = f'{d}  (top {top_n} of {n_items})' if n_items > top_n else d
             _style_title(chart, title_text)
+            chart_height_rows = 19
 
         ws.add_chart(chart, anchor)
+        pair_height = chart_height_rows
 
-    # ---------------- Full category breakdown (every category, not just top-N) ----------------
-    n_chart_rows = max(1, -(-len(dims) // 3))
-    section_header_row = anchor_rows[n_chart_rows - 1] + 22
-    ws.merge_cells(f'A{section_header_row}:{last_col_letter}{section_header_row}')
-    note = ws.cell(row=section_header_row, column=1)
-    note.value = ('\u25bc  Full category breakdown \u2014 every category for each dimension '
-                   '(the charts above show the top categories only).')
-    note.font = Font(name='Calibri', size=10, italic=True, color=NAVY)
-    note.alignment = Alignment(horizontal='left', vertical='center')
-    ws.row_dimensions[section_header_row].height = 20
-    for cell in ws[f'A{section_header_row}:{last_col_letter}{section_header_row}'][0]:
-        cell.fill = PatternFill('solid', start_color=LIGHT)
+        # ---- second chart: ALL categories, directly underneath ----
+        if n_items > top_n:
+            all_height_cm = max(9.5, n_items * 0.35 + 2)
+            all_height_rows = int(all_height_cm / ROW_CM) + 1
+            anchor2_row = row_cursor + chart_height_rows + 1
+            anchor2 = f'{get_column_letter(c0)}{anchor2_row}'
 
-    table_thin = Side(style='thin', color='C9D6D6')
-    table_border = Border(left=table_thin, right=table_thin, top=table_thin, bottom=table_thin)
+            chart_all = BarChart()
+            chart_all.type = 'bar'
+            chart_all.add_data(Reference(ws_piv, min_col=2, min_row=h + 1, max_row=h + n_items), titles_from_data=False)
+            chart_all.set_categories(Reference(ws_piv, min_col=1, min_row=h + 1, max_row=h + n_items))
+            chart_all.height = all_height_cm
+            chart_all.width = 12.5
+            chart_all.dataLabels = DataLabelList(showVal=True, showCatName=False, showSerName=False,
+                                                  showPercent=False, showLegendKey=False)
+            chart_all.series[0].graphicalProperties = GraphicalProperties(solidFill=PALETTE[(i + 1) % len(PALETTE)])
+            chart_all.y_axis.majorGridlines = None
+            chart_all.legend = None
+            _style_title(chart_all, f'{d}  (all {n_items} categories)')
 
-    group_start = section_header_row + 2
-    for row_idx in range(n_chart_rows):
-        group_dims = dims[row_idx * 3:(row_idx + 1) * 3]
-        max_height = 0
-        for col_idx, d in enumerate(group_dims):
-            h, g, n_items, idx, name, _ = pivot_layout[d]
-            c0 = anchor_cols_idx[col_idx]
-            c1 = c0 + 1
-            cap = ws.cell(row=group_start, column=c0, value=d)
-            cap.font = Font(name='Calibri', size=11, bold=True, color=NAVY)
-            hdr1 = ws.cell(row=group_start + 1, column=c0, value=f"='PivotTables'!A{h}")
-            hdr2 = ws.cell(row=group_start + 1, column=c1, value=f"='PivotTables'!B{h}")
-            for cell in (hdr1, hdr2):
-                cell.font = Font(name='Calibri', size=10, bold=True, color='FFFFFF')
-                cell.fill = PatternFill('solid', start_color=TEAL)
-                cell.border = table_border
-            for k in range(n_items):
-                r = group_start + 2 + k
-                lc = ws.cell(row=r, column=c0, value=f"='PivotTables'!A{h + 1 + k}")
-                vc = ws.cell(row=r, column=c1, value=f"='PivotTables'!B{h + 1 + k}")
-                lc.border = table_border
-                vc.border = table_border
-                vc.number_format = numfmt
-                if k % 2 == 1:
-                    lc.fill = PatternFill('solid', start_color=LIGHT)
-                    vc.fill = PatternFill('solid', start_color=LIGHT)
-            gr = group_start + 2 + n_items
-            glc = ws.cell(row=gr, column=c0, value='Total')
-            gvc = ws.cell(row=gr, column=c1, value=f"='PivotTables'!B{g}")
-            for cell in (glc, gvc):
-                cell.font = Font(name='Calibri', bold=True)
-                cell.border = table_border
-                cell.fill = PatternFill('solid', start_color='FFFFFF')
-            gvc.number_format = numfmt
-            max_height = max(max_height, n_items + 3)
-        group_start += max_height + 2
+            ws.add_chart(chart_all, anchor2)
+            pair_height += 1 + all_height_rows
+
+        row_group_height = max(row_group_height, pair_height)
 
     # ---------------- Column widths / row heights ----------------
     for col in range(1, n_cols_layout + 1):
         ws.column_dimensions[get_column_letter(col)].width = 8.5
-    for c0 in anchor_cols_idx:
-        ws.column_dimensions[get_column_letter(c0)].width = 26
-        ws.column_dimensions[get_column_letter(c0 + 1)].width = 13
     ws.row_dimensions[1].height = 28
     ws.row_dimensions[2].height = 28
     ws.row_dimensions[3].height = 18
