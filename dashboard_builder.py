@@ -312,15 +312,10 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
     )
     cache.records = RecordList(r=records)
 
-    # -------- layout: figure out where pivot tables live on Dashboard --------
-    n_dims = len(dims)
-    n_chart_rows = max(1, -(-n_dims // 3))  # ceil
-    chart_anchor_rows = [10, 28, 46, 64, 82, 100]
-    pivot_start_row = chart_anchor_rows[min(n_chart_rows, len(chart_anchor_rows)) - 1] + 24
-
+    # -------- layout: where the live PivotTables sheet's tables sit --------
     pivots = {}
     pivot_layout = {}  # dim -> (header_row, grand_row, n_items, fld_idx, name, caption_row)
-    running_row = pivot_start_row
+    running_row = 2
     for d in dims:
         idx = headers.index(d)
         n_items = len(CAT_FIELDS[idx])
@@ -371,13 +366,36 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
     rc_idx = headers.index(RECORD_COL) + 1
     ws_data.column_dimensions[get_column_letter(rc_idx)].hidden = True
 
+    # ---- PivotTables sheet (visible, separate from charts) ----
+    ws_piv = wb.create_sheet('PivotTables')
+    ws_piv.sheet_view.showGridLines = False
+    note = ws_piv.cell(row=1, column=1)
+    note.value = ('Live PivotTables \u2014 the engine behind every chart and KPI on the Dashboard.  '
+                   'Click any cell below \u2192 Insert \u2192 Slicer to add interactive filters \u2014 '
+                   'then Report Connections \u2192 select all PivotTables to cross-filter the whole '
+                   'Dashboard.')
+    note.font = Font(name='Calibri', size=11, italic=True, color=NAVY)
+    note.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+    ws_piv.merge_cells(start_row=1, start_column=1, end_row=1, end_column=12)
+    ws_piv.row_dimensions[1].height = 36
+    for cell in ws_piv['A1:L1'][0]:
+        cell.fill = PatternFill('solid', start_color=LIGHT)
+
+    for d in dims:
+        h, g, n_items, idx, name, caption_row = pivot_layout[d]
+        cap = ws_piv.cell(row=caption_row, column=1)
+        cap.value = d
+        cap.font = Font(name='Calibri', size=12, bold=True, color=NAVY)
+        ws_piv.add_pivot(pivots[name])
+    ws_piv.column_dimensions['A'].width = 28
+    ws_piv.column_dimensions['B'].width = 16
+
     # ---- Dashboard sheet ----
     ws_dash = wb.create_sheet('Dashboard', 0)
-    _build_dashboard(ws_dash, dims, headers, CAT_FIELDS, pivot_layout, pivots,
-                      measure_mode, measure_col, measure_label, numfmt, title, source_label, n,
-                      pivot_start_row)
+    _build_dashboard(ws_dash, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots,
+                      measure_mode, measure_col, measure_label, numfmt, title, source_label, n)
 
-    wb._sheets = [wb['Dashboard'], wb['Data']]
+    wb._sheets = [wb['Dashboard'], wb['PivotTables'], wb['Data']]
     wb.active = 0
 
     out = BytesIO()
@@ -396,9 +414,8 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
 # ---------------------------------------------------------------------
 # Step 4 - Dashboard sheet (branding + KPI cards + charts + live pivots)
 # ---------------------------------------------------------------------
-def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_layout, pivots,
-                       measure_mode, measure_col, measure_label, numfmt, title, source_label, n,
-                       pivot_start_row):
+def _build_dashboard(ws, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots,
+                       measure_mode, measure_col, measure_label, numfmt, title, source_label, n):
     ws.sheet_view.showGridLines = False
     ws.sheet_view.zoomScale = 85
     ws.page_setup.orientation = 'landscape'
@@ -452,12 +469,13 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_layout, pivots,
 
     d0 = dims[0]
     h0, g0, n0, idx0, name0, _ = pivot_layout[d0]
-    grand_addr0 = f'B{g0}'
-    top_label_addr0 = f'A{h0 + 1}'
-    top_val_addr0 = f'B{h0 + 1}'
-    second_label_addr0 = f'A{h0 + 2}' if n0 >= 2 else top_label_addr0
-    second_val_addr0 = f'B{h0 + 2}' if n0 >= 2 else top_val_addr0
-    cat_count_formula = f'COUNTA(A{h0 + 1}:A{h0 + n0})'
+    PV = "PivotTables"
+    grand_addr0 = f"'{PV}'!B{g0}"
+    top_label_addr0 = f"'{PV}'!A{h0 + 1}"
+    top_val_addr0 = f"'{PV}'!B{h0 + 1}"
+    second_label_addr0 = f"'{PV}'!A{h0 + 2}" if n0 >= 2 else top_label_addr0
+    second_val_addr0 = f"'{PV}'!B{h0 + 2}" if n0 >= 2 else top_val_addr0
+    cat_count_formula = f"COUNTA('{PV}'!A{h0 + 1}:A{h0 + n0})"
 
     kpis = [
         (kpi1_label, f'={grand_addr0}', numfmt, NAVY),
@@ -468,8 +486,8 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_layout, pivots,
     if len(dims) >= 2:
         d1 = dims[1]
         h1, g1, n1, idx1, name1, _ = pivot_layout[d1]
-        kpis.append((f'Top {d1}', f'=A{h1 + 1}', '@', ACCENT, True))
-        kpis.append((f'{measure_label} ({d1} top)', f'=B{h1 + 1}', numfmt, ACCENT))
+        kpis.append((f'Top {d1}', f"='{PV}'!A{h1 + 1}", '@', ACCENT, True))
+        kpis.append((f'{measure_label} ({d1} top)', f"='{PV}'!B{h1 + 1}", numfmt, ACCENT))
     else:
         kpis.append((f'2nd Highest {d0}', f'={second_label_addr0}', '@', ACCENT, True))
         kpis.append((f'{measure_label} (2nd)', f'={second_val_addr0}', numfmt, ACCENT))
@@ -516,8 +534,8 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_layout, pivots,
 
         if n_items <= DONUT_THRESHOLD:
             chart = DoughnutChart()
-            chart.add_data(Reference(ws, min_col=2, min_row=h, max_row=h + n_items), titles_from_data=True)
-            chart.set_categories(Reference(ws, min_col=1, min_row=h + 1, max_row=h + n_items))
+            chart.add_data(Reference(ws_piv, min_col=2, min_row=h, max_row=h + n_items), titles_from_data=True)
+            chart.set_categories(Reference(ws_piv, min_col=1, min_row=h + 1, max_row=h + n_items))
             chart.height = 8
             chart.width = 9.5
             chart.dataLabels = DataLabelList(showVal=True, showCatName=False, showSerName=False,
@@ -532,8 +550,8 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_layout, pivots,
             top_n = min(n_items, MAX_CHART_CATEGORIES)
             chart = BarChart()
             chart.type = 'bar'
-            chart.add_data(Reference(ws, min_col=2, min_row=h + 1, max_row=h + top_n), titles_from_data=False)
-            chart.set_categories(Reference(ws, min_col=1, min_row=h + 1, max_row=h + top_n))
+            chart.add_data(Reference(ws_piv, min_col=2, min_row=h + 1, max_row=h + top_n), titles_from_data=False)
+            chart.set_categories(Reference(ws_piv, min_col=1, min_row=h + 1, max_row=h + top_n))
             chart.height = 9.5
             chart.width = 12.5
             chart.dataLabels = DataLabelList(showVal=True, showCatName=False, showSerName=False,
@@ -546,30 +564,8 @@ def _build_dashboard(ws, dims, headers, CAT_FIELDS, pivot_layout, pivots,
 
         ws.add_chart(chart, anchor)
 
-    # ---------------- Live PivotTables section ----------------
-    note_row = pivot_start_row - 2
-    ws.merge_cells(f'A{note_row}:{last_col_letter}{note_row}')
-    note = ws.cell(row=note_row, column=1)
-    note.value = ('\u25bc  Live PivotTables (the engine behind every chart and KPI above).  '
-                   'Click any cell below \u2192 Insert \u2192 Slicer to add interactive filters \u2014 '
-                   'then Report Connections \u2192 select all PivotTables to cross-filter everything on this sheet.')
-    note.font = Font(name='Calibri', size=10, italic=True, color=NAVY)
-    note.alignment = Alignment(horizontal='left', vertical='center')
-    ws.row_dimensions[note_row].height = 22
-    for cell in ws[f'A{note_row}:{last_col_letter}{note_row}'][0]:
-        cell.fill = PatternFill('solid', start_color=LIGHT)
-
-    for d in dims:
-        h, g, n_items, idx, name, caption_row = pivot_layout[d]
-        cap = ws.cell(row=caption_row, column=1)
-        cap.value = d
-        cap.font = Font(name='Calibri', size=12, bold=True, color=NAVY)
-        ws.add_pivot(pivots[name])
-
     # ---------------- Column widths / row heights ----------------
-    ws.column_dimensions['A'].width = 28
-    ws.column_dimensions['B'].width = 16
-    for col in range(3, n_cols_layout + 1):
+    for col in range(1, n_cols_layout + 1):
         ws.column_dimensions[get_column_letter(col)].width = 8.5
     ws.row_dimensions[1].height = 28
     ws.row_dimensions[2].height = 28
