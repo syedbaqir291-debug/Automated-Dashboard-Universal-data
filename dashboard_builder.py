@@ -1,34 +1,46 @@
 """
 dashboard_builder.py
-Generic "upload any data -> static dashboard" engine.
+Generic "upload any data -> dashboard" engine.
 
-Builds an .xlsx with:
+Builds an .xlsx (or .xlsm, if a macro template is available) with:
   - Dashboard   : title (+ OMAC Developers capsule), KPI cards (formulas
                   reading cells on the Summary Data sheet), and one or two
                   charts per dimension.
   - Summary Data: per-dimension aggregate tables (category -> measure),
                   Pareto-sorted, which drive every chart and KPI card.
   - Data        : cleaned source as an Excel Table.
+  - Config      : hidden sheet listing the chosen dimensions and measure
+                  settings, read by the embedded VBA macro (if present).
 
-NOTE: This version intentionally does NOT write any native PivotTable /
-PivotCache XML. Hand-built pivot cache parts almost never satisfy Excel's
-schema validator, which causes the "we found a problem with some content"
-repair prompt on open -- and Excel's auto-repair then deletes the pivot
-parts AND the cell ranges they "own", wiping out the literal fallback
-values the charts/KPIs depended on, leaving a blank dashboard.
+NOTE: This version intentionally does NOT hand-write any native
+PivotTable / PivotCache XML itself. Hand-built pivot cache parts almost
+never satisfy Excel's schema validator, which causes the "we found a
+problem with some content" repair prompt on open -- and Excel's
+auto-repair then deletes the pivot parts AND the cell ranges they "own",
+wiping out the literal fallback values the charts/KPIs depended on,
+leaving a blank dashboard.
 
-Interactivity for end users is provided by the Streamlit app (app.py)
-itself. If a user wants a native Excel PivotTable, they can select the
-'SourceData' table on the Data sheet and use Insert -> PivotTable --
-Excel will then author a valid pivot cache itself.
+If MACRO_TEMPLATE_PATH points to an existing .xlsm containing a
+Workbook_Open macro (see ThisWorkbook_macro.vba), build_workbook() starts
+from that template with keep_vba=True so the macro is carried through
+byte-for-byte. On open, that macro uses Excel's own PivotCaches/
+PivotTables/Slicers APIs (reading the hidden Config sheet written here)
+to build real, slicer-connected PivotTables and PivotCharts -- which
+Excel always authors validly, since Excel is writing its own file.
+
+If no template is present, build_workbook() falls back to the previous
+plain .xlsx behaviour (static charts off the Summary Data sheet). Either
+way the user can also select the 'SourceData' table on the Data sheet and
+use Insert -> PivotTable themselves.
 """
 
+import os
 import re
 import numpy as np
 import pandas as pd
 from io import BytesIO
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -51,9 +63,22 @@ PALETTE = [TEAL, NAVY, ACCENT, 'E67E22', 'F1C40F', '27AE60', '8E44AD', '34495E']
 RECORD_COL = '__Records__'
 BLANK = '(Blank)'
 
+# Path to the macro-enabled template (see ThisWorkbook_macro.vba for the
+# one-time setup that creates this file). If present, build_workbook()
+# returns a .xlsm with real, slicer-connected PivotTables/PivotCharts.
+MACRO_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dashboard_macro_template.xlsm')
+
 MAX_DIMENSIONS = 8
 MAX_CHART_CATEGORIES = 10
 DONUT_THRESHOLD = 5  # <= this many categories -> donut, else bar
+
+
+def using_macro_template():
+    """True if dashboard_macro_template.xlsm is present, in which case
+    build_workbook() returns an .xlsm with real PivotTables/PivotCharts/
+    Slicers (built by the embedded macro on open)."""
+    return os.path.exists(MACRO_TEMPLATE_PATH)
+
 
 # Name of the sheet that holds the per-dimension aggregate tables that
 # drive every chart and KPI formula on the Dashboard.
@@ -275,9 +300,24 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
         running_row = grand_row + 2
 
     # -------- workbook --------
-    wb = Workbook()
-    ws_data = wb.active
-    ws_data.title = 'Data'
+    if os.path.exists(MACRO_TEMPLATE_PATH):
+        wb = load_workbook(MACRO_TEMPLATE_PATH, keep_vba=True)
+        # Repurpose the template's first sheet as 'Data' and drop any others
+        # so we start from a clean slate (the macro rebuilds everything else
+        # on open anyway).
+        existing_sheets = list(wb.sheetnames)
+        ws_data = wb[existing_sheets[0]]
+        ws_data.title = 'Data'
+        for name in existing_sheets[1:]:
+            del wb[name]
+        if ws_data.max_row > 0:
+            ws_data.delete_rows(1, ws_data.max_row)
+        for tbl_name in list(ws_data.tables.keys()):
+            del ws_data.tables[tbl_name]
+    else:
+        wb = Workbook()
+        ws_data = wb.active
+        ws_data.title = 'Data'
 
     header_fill = PatternFill('solid', start_color=NAVY)
     header_font = Font(bold=True, color='FFFFFF', name='Calibri')
@@ -355,7 +395,17 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
                       measure_mode, measure_col, measure_label, numfmt, title, source_label, n,
                       chart_types)
 
-    wb._sheets = [wb['Dashboard'], wb[SUMMARY_SHEET], wb['Data']]
+    # ---- hidden Config sheet (read by the ThisWorkbook_macro.vba on open) ----
+    ws_cfg = wb.create_sheet('Config')
+    ws_cfg.cell(row=1, column=1, value=len(dims))
+    ws_cfg.cell(row=1, column=2, value=measure_mode)
+    ws_cfg.cell(row=2, column=2, value=measure_col or '')
+    ws_cfg.cell(row=3, column=2, value=measure_label)
+    for i, d in enumerate(dims, start=1):
+        ws_cfg.cell(row=i + 1, column=1, value=d)
+    ws_cfg.sheet_state = 'hidden'
+
+    wb._sheets = [wb['Dashboard'], wb[SUMMARY_SHEET], wb['Data'], wb['Config']]
     wb.active = 0
 
     out = BytesIO()
