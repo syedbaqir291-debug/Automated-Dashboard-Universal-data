@@ -3,7 +3,7 @@ import streamlit as st
 
 from dashboard_builder import (
     load_dataframe, clean_dataframe, profile_columns, build_workbook,
-    MAX_DIMENSIONS, BLANK, BRAND,
+    MAX_DIMENSIONS, BLANK, BRAND, using_macro_template,
 )
 
 NAVY = "#1F4E5C"
@@ -286,17 +286,44 @@ if generate:
 
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.markdown("### ⬇️ Download")
+
+    macro_enabled = using_macro_template()
+    out_name = "Dashboard.xlsm" if macro_enabled else "Dashboard.xlsx"
+    out_mime = (
+        "application/vnd.ms-excel.sheet.macroEnabled.12"
+        if macro_enabled else
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
     st.download_button(
-        "Download Dashboard.xlsx",
+        f"Download {out_name}",
         data=xlsx_bytes,
-        file_name="Dashboard.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        file_name=out_name,
+        mime=out_mime,
         type="primary",
         use_container_width=True,
     )
 
-    with st.expander("📌 About the downloaded workbook", expanded=True):
-        st.markdown("""
+    if macro_enabled:
+        with st.expander("📌 About the downloaded workbook", expanded=True):
+            st.markdown("""
+The workbook has 4 sheets: **Dashboard** (KPI cards + charts), **Summary
+Data** (per-category tables behind the KPIs), **Data** (cleaned source as
+an Excel Table), and a hidden **Config** sheet.
+
+**On first open, Excel will show a yellow security bar — click "Enable
+Content".** This runs a built-in macro that automatically builds real
+PivotTables, PivotCharts and **Slicers** (one per dimension, all
+cross-connected) on a new "Live Pivots" area and on the Dashboard. Use the
+slicers to filter everything at once — that's the genuinely interactive
+view.
+
+The macro re-runs (and rebuilds cleanly, with no duplicates) every time
+the file is opened, so it always reflects the data in the **Data** sheet.
+            """)
+    else:
+        with st.expander("📌 About the downloaded workbook", expanded=True):
+            st.markdown("""
 The workbook has 3 sheets: **Dashboard** (KPI cards + charts), **Summary
 Data** (the per-category tables that drive every chart and KPI on the
 Dashboard), and **Data** (cleaned source as an Excel Table).
@@ -312,7 +339,11 @@ to explore the raw data interactively yourself:
 For interactive, slicer-style filtering without leaving the browser, use
 this app's own charts and KPI preview above — they update live as you
 change your dimension/measure selections.
-        """)
+
+*Tip: set up `dashboard_macro_template.xlsm` (see
+`ThisWorkbook_macro.vba`) to enable automatic, slicer-connected
+PivotTables and PivotCharts in every downloaded dashboard.*
+            """)
     st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown(f"""
