@@ -193,12 +193,10 @@ def _make_pivot(name, ncols, row_field_idx, n_items, ref, cache,
         rowFields=[RowColField(x=row_field_idx)],
         rowItems=rowItems,
         colFields=[], colItems=[RowColItem(r=0, i=0)],
-        dataFields=[DataField(name=measure_label, fld=measure_idx, subtotal=subtotal,
-                               baseField=0, baseItem=0)],
+        dataFields=[DataField(name=measure_label, fld=measure_idx, subtotal=subtotal)],
         pivotTableStyleInfo=PivotTableStyle(name='PivotStyleMedium9', showRowHeaders=True,
                                              showColHeaders=True, showRowStripes=True,
                                              showColStripes=False, showLastColumn=False),
-        rowHeaderCaption=field_caption,
     )
     pt.cache = cache
     return pt
