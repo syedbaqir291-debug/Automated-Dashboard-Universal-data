@@ -38,6 +38,7 @@ from openpyxl.chart import BarChart, DoughnutChart, Reference
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.marker import DataPoint
 from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.chart.data_source import AxDataSource, StrRef, StrData, StrVal, NumRef, NumData, NumVal, NumDataSource
 from openpyxl.drawing.text import CharacterProperties
 
 NAVY = '1F4E5C'
@@ -192,7 +193,8 @@ def _make_pivot(name, ncols, row_field_idx, n_items, ref, cache,
         rowFields=[RowColField(x=row_field_idx)],
         rowItems=rowItems,
         colFields=[], colItems=[RowColItem(r=0, i=0)],
-        dataFields=[DataField(name=measure_label, fld=measure_idx, subtotal=subtotal)],
+        dataFields=[DataField(name=measure_label, fld=measure_idx, subtotal=subtotal,
+                               baseField=0, baseItem=0)],
         pivotTableStyleInfo=PivotTableStyle(name='PivotStyleMedium9', showRowHeaders=True,
                                              showColHeaders=True, showRowStripes=True,
                                              showColStripes=False, showLastColumn=False),
@@ -208,6 +210,22 @@ def _style_title(chart, text):
         chart.title.tx.rich.p[0].r[0].rPr = CharacterProperties(sz=1200, b=True, solidFill=NAVY)
     except Exception:
         pass
+
+
+def _text_categories(sheet_name, col_letter, min_row, max_row, values):
+    """AxDataSource with strRef + cached strData, so charts render category
+    labels correctly even without an Excel refresh (and so they're typed as
+    text rather than openpyxl's default numRef, which is wrong for text)."""
+    ref = f"'{sheet_name}'!${col_letter}${min_row}:${col_letter}${max_row}"
+    cache = StrData(ptCount=len(values), pt=[StrVal(idx=i, v=str(v)) for i, v in enumerate(values)])
+    return AxDataSource(strRef=StrRef(f=ref, strCache=cache))
+
+
+def _num_values(sheet_name, col_letter, min_row, max_row, values):
+    """NumDataSource (numRef + cached numCache) for series values."""
+    ref = f"'{sheet_name}'!${col_letter}${min_row}:${col_letter}${max_row}"
+    cache = NumData(ptCount=len(values), pt=[NumVal(idx=i, v=v) for i, v in enumerate(values)])
+    return NumDataSource(numRef=NumRef(f=ref, numCache=cache))
 
 
 # ---------------------------------------------------------------------
@@ -263,10 +281,19 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
 
     # -------- categorical ordering (Pareto: highest value first) --------
     CAT_FIELDS = {}
+    CAT_VALUES = {}
+    GRAND_TOTAL = {}
     for d in dims:
         idx = headers.index(d)
         ser = sort_fn(d).fillna(0).sort_values(ascending=False)
         CAT_FIELDS[idx] = [str(v) for v in ser.index.tolist()]
+        CAT_VALUES[idx] = [float(v) for v in ser.tolist()]
+        if subtotal == 'sum':
+            GRAND_TOTAL[idx] = float(df[measure_col].sum())
+        elif subtotal == 'average':
+            GRAND_TOTAL[idx] = float(df[measure_col].mean())
+        else:
+            GRAND_TOTAL[idx] = float(n)
     CAT_INDEX = {idx: {v: i for i, v in enumerate(order)} for idx, order in CAT_FIELDS.items()}
 
     # -------- cache fields --------
@@ -386,13 +413,32 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
         cap = ws_piv.cell(row=caption_row, column=1)
         cap.value = d
         cap.font = Font(name='Calibri', size=12, bold=True, color=NAVY)
+
+        # Literal fallback values: these are what the PivotTable computes too,
+        # but written directly so charts/KPIs still work even before Excel
+        # refreshes (or if a user has pivot auto-refresh disabled).
+        hdr1 = ws_piv.cell(row=h, column=1, value=d)
+        hdr2 = ws_piv.cell(row=h, column=2, value=measure_label)
+        for cell in (hdr1, hdr2):
+            cell.font = Font(name='Calibri', bold=True, color='FFFFFF')
+            cell.fill = PatternFill('solid', start_color=NAVY)
+        for k in range(n_items):
+            lc = ws_piv.cell(row=h + 1 + k, column=1, value=CAT_FIELDS[idx][k])
+            vc = ws_piv.cell(row=h + 1 + k, column=2, value=CAT_VALUES[idx][k])
+            vc.number_format = numfmt
+        glc = ws_piv.cell(row=g, column=1, value='Grand Total')
+        gvc = ws_piv.cell(row=g, column=2, value=GRAND_TOTAL[idx])
+        glc.font = Font(bold=True)
+        gvc.font = Font(bold=True)
+        gvc.number_format = numfmt
+
         ws_piv.add_pivot(pivots[name])
     ws_piv.column_dimensions['A'].width = 28
     ws_piv.column_dimensions['B'].width = 16
 
     # ---- Dashboard sheet ----
     ws_dash = wb.create_sheet('Dashboard', 0)
-    _build_dashboard(ws_dash, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots,
+    _build_dashboard(ws_dash, ws_piv, dims, headers, CAT_FIELDS, CAT_VALUES, pivot_layout, pivots,
                       measure_mode, measure_col, measure_label, numfmt, title, source_label, n)
 
     wb._sheets = [wb['Dashboard'], wb['PivotTables'], wb['Data']]
@@ -414,7 +460,7 @@ def build_workbook(df, dims, measure_mode, measure_col=None,
 # ---------------------------------------------------------------------
 # Step 4 - Dashboard sheet (branding + KPI cards + charts + live pivots)
 # ---------------------------------------------------------------------
-def _build_dashboard(ws, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots,
+def _build_dashboard(ws, ws_piv, dims, headers, CAT_FIELDS, CAT_VALUES, pivot_layout, pivots,
                        measure_mode, measure_col, measure_label, numfmt, title, source_label, n):
     ws.sheet_view.showGridLines = False
     ws.sheet_view.zoomScale = 85
@@ -541,13 +587,14 @@ def _build_dashboard(ws, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots
         if n_items <= DONUT_THRESHOLD:
             chart = DoughnutChart()
             chart.add_data(Reference(ws_piv, min_col=2, min_row=h, max_row=h + n_items), titles_from_data=True)
-            chart.set_categories(Reference(ws_piv, min_col=1, min_row=h + 1, max_row=h + n_items))
             chart.height = 8
             chart.width = 9.5
             chart.dataLabels = DataLabelList(showVal=True, showCatName=False, showSerName=False,
                                               showPercent=False, showLegendKey=False)
             chart.holeSize = 55
             _style_title(chart, d)
+            chart.series[0].cat = _text_categories(ws_piv.title, 'A', h + 1, h + n_items, CAT_FIELDS[idx][:n_items])
+            chart.series[0].val = _num_values(ws_piv.title, 'B', h + 1, h + n_items, CAT_VALUES[idx][:n_items])
             chart.series[0].dPt = [
                 DataPoint(idx=k, spPr=GraphicalProperties(solidFill=PALETTE[k % len(PALETTE)]))
                 for k in range(n_items)
@@ -559,12 +606,21 @@ def _build_dashboard(ws, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots
             chart = BarChart()
             chart.type = 'bar'
             chart.add_data(Reference(ws_piv, min_col=2, min_row=h + 1, max_row=h + top_n), titles_from_data=False)
-            chart.set_categories(Reference(ws_piv, min_col=1, min_row=h + 1, max_row=h + top_n))
             chart.height = 9.5
             chart.width = 12.5
             chart.dataLabels = DataLabelList(showVal=True, showCatName=False, showSerName=False,
                                               showPercent=False, showLegendKey=False)
+            chart.series[0].cat = _text_categories(ws_piv.title, 'A', h + 1, h + top_n, CAT_FIELDS[idx][:top_n])
+            chart.series[0].val = _num_values(ws_piv.title, 'B', h + 1, h + top_n, CAT_VALUES[idx][:top_n])
             chart.series[0].graphicalProperties = GraphicalProperties(solidFill=PALETTE[i % len(PALETTE)])
+            chart.x_axis.axPos = 'l'
+            chart.y_axis.axPos = 'b'
+            chart.x_axis.delete = False
+            chart.y_axis.delete = False
+            chart.x_axis.tickLblPos = 'nextTo'
+            chart.y_axis.tickLblPos = 'nextTo'
+            chart.x_axis.crosses = 'autoZero'
+            chart.y_axis.crosses = 'autoZero'
             chart.y_axis.majorGridlines = None
             chart.legend = None
             title_text = f'{d}  (top {top_n} of {n_items})' if n_items > top_n else d
@@ -584,12 +640,21 @@ def _build_dashboard(ws, ws_piv, dims, headers, CAT_FIELDS, pivot_layout, pivots
             chart_all = BarChart()
             chart_all.type = 'bar'
             chart_all.add_data(Reference(ws_piv, min_col=2, min_row=h + 1, max_row=h + n_items), titles_from_data=False)
-            chart_all.set_categories(Reference(ws_piv, min_col=1, min_row=h + 1, max_row=h + n_items))
             chart_all.height = all_height_cm
             chart_all.width = 12.5
             chart_all.dataLabels = DataLabelList(showVal=True, showCatName=False, showSerName=False,
                                                   showPercent=False, showLegendKey=False)
+            chart_all.series[0].cat = _text_categories(ws_piv.title, 'A', h + 1, h + n_items, CAT_FIELDS[idx][:n_items])
+            chart_all.series[0].val = _num_values(ws_piv.title, 'B', h + 1, h + n_items, CAT_VALUES[idx][:n_items])
             chart_all.series[0].graphicalProperties = GraphicalProperties(solidFill=PALETTE[(i + 1) % len(PALETTE)])
+            chart_all.x_axis.axPos = 'l'
+            chart_all.y_axis.axPos = 'b'
+            chart_all.x_axis.delete = False
+            chart_all.y_axis.delete = False
+            chart_all.x_axis.tickLblPos = 'nextTo'
+            chart_all.y_axis.tickLblPos = 'nextTo'
+            chart_all.x_axis.crosses = 'autoZero'
+            chart_all.y_axis.crosses = 'autoZero'
             chart_all.y_axis.majorGridlines = None
             chart_all.legend = None
             _style_title(chart_all, f'{d}  (all {n_items} categories)')
