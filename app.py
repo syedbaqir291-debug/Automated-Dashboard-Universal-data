@@ -1,127 +1,299 @@
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
 from dashboard_builder import (
     load_dataframe, clean_dataframe, profile_columns, build_workbook,
-    MAX_DIMENSIONS,
+    MAX_DIMENSIONS, BLANK, BRAND,
 )
 
-st.set_page_config(page_title="Auto Pivot Dashboard Generator", layout="wide")
+NAVY = "#1F4E5C"
+TEAL = "#2E8B8B"
+GOLD = "#D4AC0D"
+ACCENT = "#C0392B"
+LIGHT = "#EAF2F2"
 
-st.title("📊 Auto Pivot Dashboard Generator")
+st.set_page_config(page_title="Auto Pivot Dashboard Generator", page_icon="📊", layout="wide")
+
+# ----------------------------------------------------------------------
+# Styling
+# ----------------------------------------------------------------------
+st.markdown(f"""
+<style>
+.stApp {{ background-color: #F7FAFA; }}
+
+.omac-header {{
+    background: linear-gradient(135deg, {NAVY} 0%, {TEAL} 100%);
+    border-radius: 14px;
+    padding: 1.4rem 1.8rem;
+    color: white;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.2rem;
+    box-shadow: 0 4px 14px rgba(31,78,92,0.25);
+}}
+.omac-header h1 {{ margin: 0; font-size: 1.7rem; }}
+.omac-header p {{ margin: 0.15rem 0 0 0; opacity: 0.85; font-size: 0.95rem; }}
+.omac-badge {{
+    background: {GOLD};
+    color: {NAVY};
+    font-weight: 700;
+    font-size: 0.8rem;
+    padding: 0.35rem 0.9rem;
+    border-radius: 999px;
+    white-space: nowrap;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+}}
+
+.section-card {{
+    background: white;
+    border-radius: 12px;
+    padding: 1.2rem 1.4rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+    border: 1px solid #E5EEEE;
+}}
+.section-card h3 {{ margin-top: 0; color: {NAVY}; }}
+
+div[data-testid="stFileUploaderDropzone"] {{
+    background: {LIGHT};
+    border: 2px dashed {TEAL};
+    border-radius: 12px;
+}}
+
+.stButton button[kind="primary"] {{
+    background: linear-gradient(135deg, {NAVY} 0%, {TEAL} 100%);
+    border: none;
+    border-radius: 8px;
+    padding: 0.6rem 1.6rem;
+    font-weight: 700;
+    box-shadow: 0 3px 8px rgba(31,78,92,0.3);
+}}
+
+.omac-footer {{
+    text-align: center;
+    padding: 1rem;
+    margin-top: 2rem;
+    color: {NAVY};
+    font-size: 0.85rem;
+    border-top: 1px solid #E5EEEE;
+}}
+.omac-footer .pill {{
+    display: inline-block;
+    background: {GOLD};
+    color: {NAVY};
+    font-weight: 700;
+    padding: 0.25rem 0.8rem;
+    border-radius: 999px;
+    margin-top: 0.3rem;
+}}
+</style>
+""", unsafe_allow_html=True)
+
+# ----------------------------------------------------------------------
+# Header
+# ----------------------------------------------------------------------
+st.markdown(f"""
+<div class="omac-header">
+    <div>
+        <h1>📊 Auto Pivot Dashboard Generator</h1>
+        <p>Upload any data &middot; pick dimensions &amp; a measure &middot; get a workbook full of
+        native, slicer-ready PivotTables, KPI cards and charts.</p>
+    </div>
+    <div class="omac-badge">{BRAND}</div>
+</div>
+""", unsafe_allow_html=True)
+
+# ----------------------------------------------------------------------
+# 1. Upload
+# ----------------------------------------------------------------------
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown("### 1️⃣ Upload your data")
+uploaded = st.file_uploader(
+    "Drag & drop a CSV or Excel file here",
+    type=["csv", "xlsx", "xls"],
+    label_visibility="collapsed",
+)
+st.markdown('</div>', unsafe_allow_html=True)
+
+if uploaded is None:
+    st.info("👆 Upload a file to get started — try your complaint register, sales log, "
+            "attendance sheet... whatever you've got. We'll figure out the rest.")
+    st.markdown(f"""
+    <div class="omac-footer">
+        Built for healthcare quality &amp; analytics teams<br>
+        <span class="pill">{BRAND}</span>
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
+
+try:
+    df = load_dataframe(uploaded, uploaded.name)
+except Exception as e:
+    st.error(f"Couldn't read this file: {e}")
+    st.stop()
+
+df = clean_dataframe(df)
+profile = profile_columns(df)
+
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Rows", f"{len(df):,}")
+m2.metric("Columns", f"{len(df.columns)}")
+m3.metric("Dimension candidates", f"{len(profile['dimension_candidates'])}")
+m4.metric("Numeric columns", f"{len(profile['numeric_candidates'])}")
+with st.expander("Preview data"):
+    st.dataframe(df.head(20), use_container_width=True)
+st.markdown('</div>', unsafe_allow_html=True)
+
+if not profile['dimension_candidates']:
+    st.error("Couldn't find any suitable breakdown columns in this file — "
+             "try a file with at least one categorical / low-cardinality column.")
+    st.stop()
+
+# ----------------------------------------------------------------------
+# 2. Configuration
+# ----------------------------------------------------------------------
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown("### 2️⃣ Choose breakdown columns (dimensions)")
 st.caption(
-    "Upload any CSV / Excel file. The tool builds a workbook with native "
-    "PivotTables (all sharing one PivotCache), KPI cards driven directly "
-    "from those pivots, and matching charts — ready for you to drop "
-    "Slicers onto in Excel for full cross-filtering."
+    f"These become your PivotTables, charts and slicer fields. We've pre-selected good "
+    f"candidates — add or remove as needed (max {MAX_DIMENSIONS})."
+)
+dims = st.multiselect(
+    "Dimension columns",
+    options=profile['dimension_candidates'],
+    default=profile['suggested_dimensions'],
+    max_selections=MAX_DIMENSIONS,
+    label_visibility="collapsed",
+)
+st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown("### 3️⃣ Choose the measure (dependent variable)")
+measure_mode_label = st.radio(
+    "What should each pivot/chart measure?",
+    options=["Count of records", "Sum of a numeric column", "Average of a numeric column"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
 
-uploaded = st.file_uploader("Upload data file", type=["csv", "xlsx", "xls"])
-
-if uploaded is not None:
-    try:
-        df = load_dataframe(uploaded, uploaded.name)
-    except Exception as e:
-        st.error(f"Couldn't read file: {e}")
-        st.stop()
-
-    df = clean_dataframe(df)
-    st.success(f"Loaded **{len(df):,}** rows × **{len(df.columns)}** columns")
-    with st.expander("Preview data", expanded=False):
-        st.dataframe(df.head(20), use_container_width=True)
-
-    profile = profile_columns(df)
-
-    if not profile['dimension_candidates']:
-        st.error("Couldn't find any suitable breakdown columns in this file.")
-        st.stop()
-
-    st.subheader("1. Breakdown columns (dimensions)")
-    st.caption(
-        "These become your PivotTables, charts, and slicer fields. "
-        "We've pre-selected good candidates — add or remove as needed "
-        f"(max {MAX_DIMENSIONS})."
-    )
-    dims = st.multiselect(
-        "Dimension columns",
-        options=profile['dimension_candidates'],
-        default=profile['suggested_dimensions'],
-        max_selections=MAX_DIMENSIONS,
-    )
-
-    st.subheader("2. Measure (dependent variable)")
-    measure_mode_label = st.radio(
-        "What should each pivot/chart measure?",
-        options=["Count of records", "Sum of a numeric column", "Average of a numeric column"],
-        horizontal=True,
-    )
-
-    measure_col = None
-    if measure_mode_label != "Count of records":
-        if not profile['numeric_candidates']:
-            st.warning("No numeric columns detected — falling back to Count of records.")
-            measure_mode_label = "Count of records"
-        else:
-            measure_col = st.selectbox("Numeric column", options=profile['numeric_candidates'])
-
-    measure_mode = {
-        "Count of records": "count",
-        "Sum of a numeric column": "sum",
-        "Average of a numeric column": "average",
-    }[measure_mode_label]
-
-    st.subheader("3. Dashboard title")
-    default_title = "Auto-Generated Dashboard"
-    title = st.text_input("Title shown on the Dashboard sheet", value=default_title)
-    source_label = st.text_input("Source label (optional, shown under the title)", value=uploaded.name)
-
-    st.divider()
-
-    if not dims:
-        st.warning("Select at least one dimension column to continue.")
+measure_col = None
+if measure_mode_label != "Count of records":
+    if not profile['numeric_candidates']:
+        st.warning("No numeric columns detected — falling back to Count of records.")
+        measure_mode_label = "Count of records"
     else:
-        if st.button("🚀 Generate Dashboard", type="primary"):
-            with st.spinner("Building PivotTables, charts and KPI cards..."):
-                try:
-                    xlsx_bytes = build_workbook(
-                        df, dims, measure_mode, measure_col,
-                        title=title, source_label=source_label,
-                    )
-                except Exception as e:
-                    st.error(f"Something went wrong while building the workbook: {e}")
-                    st.stop()
+        measure_col = st.selectbox("Numeric column", options=profile['numeric_candidates'])
 
-            st.success("Dashboard ready!")
-            st.download_button(
-                "⬇️ Download Dashboard.xlsx",
-                data=xlsx_bytes,
-                file_name="Dashboard.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+measure_mode = {
+    "Count of records": "count",
+    "Sum of a numeric column": "sum",
+    "Average of a numeric column": "average",
+}[measure_mode_label]
+st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown("### 4️⃣ Title your dashboard")
+col_a, col_b = st.columns(2)
+title = col_a.text_input("Dashboard title", value="Auto-Generated Dashboard")
+source_label = col_b.text_input("Source label (optional)", value=uploaded.name)
+st.markdown('</div>', unsafe_allow_html=True)
+
+# ----------------------------------------------------------------------
+# 3. Generate + interactive preview
+# ----------------------------------------------------------------------
+if not dims:
+    st.warning("Select at least one dimension column to continue.")
+    st.stop()
+
+generate = st.button("🚀 Generate Dashboard", type="primary", use_container_width=True)
+
+if generate:
+    with st.spinner("Building PivotTables, charts and KPI cards..."):
+        try:
+            xlsx_bytes = build_workbook(
+                df, dims, measure_mode, measure_col,
+                title=title, source_label=source_label,
             )
+        except Exception as e:
+            st.error(f"Something went wrong while building the workbook: {e}")
+            st.stop()
 
-            with st.expander("📌 One last step in Excel — adding Slicers", expanded=True):
-                st.markdown(
-                    """
-The workbook already contains real, native PivotTables (one per
-dimension you picked), all sharing a single PivotCache — that's what
-makes cross-filtering possible.
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown("### ✅ Output preview")
+
+    # ---- live KPI preview (mirrors what the Excel KPI cards will show) ----
+    if measure_mode == 'count':
+        agg_label, agg_fmt = "Records", "{:,.0f}"
+        def agg(d): return df[d].fillna(BLANK).astype(str).value_counts()
+        total_val = len(df)
+        total_label = "Total Records"
+    elif measure_mode == 'sum':
+        agg_label, agg_fmt = f"Sum of {measure_col}", "{:,.2f}"
+        def agg(d): return df.assign(**{d: df[d].fillna(BLANK).astype(str)}).groupby(d)[measure_col].sum(min_count=1)
+        total_val = df[measure_col].sum()
+        total_label = f"Total {measure_col}"
+    else:
+        agg_label, agg_fmt = f"Average {measure_col}", "{:,.2f}"
+        def agg(d): return df.assign(**{d: df[d].fillna(BLANK).astype(str)}).groupby(d)[measure_col].mean()
+        total_val = df[measure_col].mean()
+        total_label = f"Overall Average {measure_col}"
+
+    d0 = dims[0]
+    s0 = agg(d0).fillna(0).sort_values(ascending=False)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(total_label, agg_fmt.format(total_val))
+    k2.metric(f"Top {d0}", str(s0.index[0]))
+    k3.metric(f"{agg_label} ({d0} top)", agg_fmt.format(s0.iloc[0]))
+    k4.metric(f"{d0} categories", f"{len(s0)}")
+
+    st.caption("Charts below mirror the PivotTable-driven charts in the generated workbook "
+               "(top categories shown):")
+
+    chart_cols = st.columns(3)
+    for i, d in enumerate(dims):
+        s = agg(d).fillna(0).sort_values(ascending=False).head(10)
+        with chart_cols[i % 3]:
+            st.markdown(f"**{d}**")
+            st.bar_chart(s)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown("### ⬇️ Download")
+    st.download_button(
+        "Download Dashboard.xlsx",
+        data=xlsx_bytes,
+        file_name="Dashboard.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
+
+    with st.expander("📌 One last step in Excel — adding Slicers", expanded=True):
+        st.markdown(f"""
+The **Dashboard** sheet already contains real, native PivotTables (one per
+dimension you picked, stacked below the charts) sharing a single
+PivotCache — that's what makes cross-filtering possible.
 
 To add the interactive filter buttons (Slicers):
 
-1. Open the file in Excel, **unhide the `PivotData` sheet**
-   (right-click any sheet tab → *Unhide*).
-2. Click any cell inside one of the PivotTables.
-3. **Insert → Slicer**, and tick the field(s) you want as filters
-   (e.g. the dimension columns).
-4. Right-click each slicer → **Report Connections** → tick *every*
+1. Click any cell inside one of the PivotTables on the Dashboard sheet.
+2. **Insert → Slicer**, and tick the field(s) you want as filters.
+3. Right-click each slicer → **Report Connections** → tick *every*
    PivotTable listed.
-5. Cut/paste the slicer(s) onto the **Dashboard** sheet, then
-   re-hide `PivotData`.
+4. Drag the slicer(s) next to the charts at the top.
 
 Once connected, every chart *and* every KPI card (since they read
-PivotTable cells directly) will update together when you click a
-slicer.
-                    """
-                )
-else:
-    st.info("👆 Upload a CSV or Excel file to get started.")
+PivotTable cells directly) updates together when you click a slicer.
+        """)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown(f"""
+<div class="omac-footer">
+    Built for healthcare quality &amp; analytics teams<br>
+    <span class="pill">{BRAND}</span>
+</div>
+""", unsafe_allow_html=True)
