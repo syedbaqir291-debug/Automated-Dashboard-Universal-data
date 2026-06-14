@@ -1,323 +1,592 @@
+"""
+dashboard_builder.py
+Generic "upload any data -> static dashboard" engine.
+
+Builds an .xlsx with:
+  - Dashboard   : title (+ OMAC Developers capsule), KPI cards (formulas
+                  reading cells on the Summary Data sheet), and one or two
+                  charts per dimension.
+  - Summary Data: per-dimension aggregate tables (category -> measure),
+                  Pareto-sorted, which drive every chart and KPI card.
+  - Data        : cleaned source as an Excel Table.
+
+NOTE: This version intentionally does NOT write any native PivotTable /
+PivotCache XML. Hand-built pivot cache parts almost never satisfy Excel's
+schema validator, which causes the "we found a problem with some content"
+repair prompt on open -- and Excel's auto-repair then deletes the pivot
+parts AND the cell ranges they "own", wiping out the literal fallback
+values the charts/KPIs depended on, leaving a blank dashboard.
+
+Interactivity for end users is provided by the Streamlit app (app.py)
+itself. If a user wants a native Excel PivotTable, they can select the
+'SourceData' table on the Data sheet and use Insert -> PivotTable --
+Excel will then author a valid pivot cache itself.
+"""
+
+import re
+import numpy as np
 import pandas as pd
-import streamlit as st
+from io import BytesIO
 
-from dashboard_builder import (
-    load_dataframe, clean_dataframe, profile_columns, build_workbook,
-    MAX_DIMENSIONS, BLANK, BRAND,
-)
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
-NAVY = "#1F4E5C"
-TEAL = "#2E8B8B"
-GOLD = "#D4AC0D"
-ACCENT = "#C0392B"
-LIGHT = "#EAF2F2"
+from openpyxl.chart import BarChart, DoughnutChart, Reference
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.marker import DataPoint
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.chart.data_source import AxDataSource, StrRef, StrData, StrVal, NumRef, NumData, NumVal, NumDataSource
+from openpyxl.drawing.text import CharacterProperties
 
-st.set_page_config(page_title="Auto Pivot Dashboard Generator", page_icon="📊", layout="wide")
+NAVY = '1F4E5C'
+TEAL = '2E8B8B'
+LIGHT = 'EAF2F2'
+ACCENT = 'C0392B'
+GREY = '95A5A6'
+GOLD = 'D4AC0D'
+PALETTE = [TEAL, NAVY, ACCENT, 'E67E22', 'F1C40F', '27AE60', '8E44AD', '34495E']
 
-# ----------------------------------------------------------------------
-# Styling
-# ----------------------------------------------------------------------
-st.markdown(f"""
-<style>
-.stApp {{ background-color: #F7FAFA; }}
+RECORD_COL = '__Records__'
+BLANK = '(Blank)'
 
-.omac-header {{
-    background: linear-gradient(135deg, {NAVY} 0%, {TEAL} 100%);
-    border-radius: 14px;
-    padding: 1.4rem 1.8rem;
-    color: white;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 1.2rem;
-    box-shadow: 0 4px 14px rgba(31,78,92,0.25);
-}}
-.omac-header h1 {{ margin: 0; font-size: 1.7rem; }}
-.omac-header p {{ margin: 0.15rem 0 0 0; opacity: 0.85; font-size: 0.95rem; }}
-.omac-badge {{
-    background: {GOLD};
-    color: {NAVY};
-    font-weight: 700;
-    font-size: 0.8rem;
-    padding: 0.35rem 0.9rem;
-    border-radius: 999px;
-    white-space: nowrap;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
-}}
+MAX_DIMENSIONS = 8
+MAX_CHART_CATEGORIES = 10
+DONUT_THRESHOLD = 5  # <= this many categories -> donut, else bar
 
-.section-card {{
-    background: white;
-    border-radius: 12px;
-    padding: 1.2rem 1.4rem;
-    margin-bottom: 1rem;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-    border: 1px solid #E5EEEE;
-}}
-.section-card h3 {{ margin-top: 0; color: {NAVY}; }}
+# Name of the sheet that holds the per-dimension aggregate tables that
+# drive every chart and KPI formula on the Dashboard.
+SUMMARY_SHEET = 'Summary Data'
 
-div[data-testid="stFileUploaderDropzone"] {{
-    background: {LIGHT};
-    border: 2px dashed {TEAL};
-    border-radius: 12px;
-}}
+BRAND = 'OMAC Developers \u00b7 S M Baqir'
 
-.stButton button[kind="primary"] {{
-    background: linear-gradient(135deg, {NAVY} 0%, {TEAL} 100%);
-    border: none;
-    border-radius: 8px;
-    padding: 0.6rem 1.6rem;
-    font-weight: 700;
-    box-shadow: 0 3px 8px rgba(31,78,92,0.3);
-}}
 
-.omac-footer {{
-    text-align: center;
-    padding: 1rem;
-    margin-top: 2rem;
-    color: {NAVY};
-    font-size: 0.85rem;
-    border-top: 1px solid #E5EEEE;
-}}
-.omac-footer .pill {{
-    display: inline-block;
-    background: {GOLD};
-    color: {NAVY};
-    font-weight: 700;
-    padding: 0.25rem 0.8rem;
-    border-radius: 999px;
-    margin-top: 0.3rem;
-}}
-</style>
-""", unsafe_allow_html=True)
+# ---------------------------------------------------------------------
+# Step 1 - load & profile
+# ---------------------------------------------------------------------
+def load_dataframe(file_obj, filename):
+    if filename.lower().endswith('.csv'):
+        return pd.read_csv(file_obj)
+    return pd.read_excel(file_obj)
 
-# ----------------------------------------------------------------------
-# Header
-# ----------------------------------------------------------------------
-st.markdown(f"""
-<div class="omac-header">
-    <div>
-        <h1>📊 Auto Pivot Dashboard Generator</h1>
-        <p>Upload any data &middot; pick dimensions &amp; a measure &middot; get a polished
-        workbook with KPI cards, charts and a clean summary sheet &mdash; ready to open,
-        no Excel repair prompts.</p>
-    </div>
-    <div class="omac-badge">{BRAND}</div>
-</div>
-""", unsafe_allow_html=True)
 
-# ----------------------------------------------------------------------
-# 1. Upload
-# ----------------------------------------------------------------------
-st.markdown('<div class="section-card">', unsafe_allow_html=True)
-st.markdown("### 1️⃣ Upload your data")
-uploaded = st.file_uploader(
-    "Drag & drop a CSV or Excel file here",
-    type=["csv", "xlsx", "xls"],
-    label_visibility="collapsed",
-)
-st.markdown('</div>', unsafe_allow_html=True)
+def _norm_text(v):
+    if not isinstance(v, str):
+        return v
+    v = v.replace('\n', ' ').replace('\r', ' ')
+    v = ' '.join(v.split())
+    return v
 
-if uploaded is None:
-    st.info("👆 Upload a file to get started — try your complaint register, sales log, "
-            "attendance sheet... whatever you've got. We'll figure out the rest.")
-    st.markdown(f"""
-    <div class="omac-footer">
-        Built for healthcare quality &amp; analytics teams<br>
-        <span class="pill">{BRAND}</span>
-    </div>
-    """, unsafe_allow_html=True)
-    st.stop()
 
-try:
-    df = load_dataframe(uploaded, uploaded.name)
-except Exception as e:
-    st.error(f"Couldn't read this file: {e}")
-    st.stop()
+def clean_dataframe(df):
+    """Clean headers AND normalize whitespace/newlines inside text cells.
 
-df = clean_dataframe(df)
-profile = profile_columns(df)
+    This is the generic fix for categories silently splitting into
+    near-duplicates (e.g. "Finance\\n" vs "Finance " vs "Finance  Dept")
+    which otherwise fragments groupings.
+    """
+    df = df.copy()
+    cols = []
+    seen = {}
+    for c in df.columns:
+        c2 = _norm_text(str(c))
+        if not c2 or c2.lower().startswith('unnamed'):
+            c2 = 'Column'
+        if c2 in seen:
+            seen[c2] += 1
+            c2 = f'{c2} ({seen[c2]})'
+        else:
+            seen[c2] = 0
+        cols.append(c2)
+    df.columns = cols
 
-st.markdown('<div class="section-card">', unsafe_allow_html=True)
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Rows", f"{len(df):,}")
-m2.metric("Columns", f"{len(df.columns)}")
-m3.metric("Dimension candidates", f"{len(profile['dimension_candidates'])}")
-m4.metric("Numeric columns", f"{len(profile['numeric_candidates'])}")
-with st.expander("Preview data"):
-    st.dataframe(df.head(20), use_container_width=True)
-st.markdown('</div>', unsafe_allow_html=True)
+    for col in df.columns:
+        if df[col].dtype == object or pd.api.types.is_string_dtype(df[col]):
+            df[col] = df[col].map(_norm_text)
 
-if not profile['dimension_candidates']:
-    st.error("Couldn't find any suitable breakdown columns in this file — "
-             "try a file with at least one categorical / low-cardinality column.")
-    st.stop()
+    return df
 
-# ----------------------------------------------------------------------
-# 2. Configuration
-# ----------------------------------------------------------------------
-st.markdown('<div class="section-card">', unsafe_allow_html=True)
-st.markdown("### 2️⃣ Choose breakdown columns (dimensions)")
-st.caption(
-    f"These become your summary tables, charts and KPI cards. We've pre-selected good "
-    f"candidates — add or remove as needed (max {MAX_DIMENSIONS})."
-)
-dims = st.multiselect(
-    "Dimension columns",
-    options=profile['dimension_candidates'],
-    default=profile['suggested_dimensions'],
-    max_selections=MAX_DIMENSIONS,
-    label_visibility="collapsed",
-)
-st.markdown('</div>', unsafe_allow_html=True)
 
-chart_types = {}
-if dims:
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    st.markdown("### 🍩 Chart style per dimension")
-    st.caption(
-        "By default, dimensions with 5 or fewer categories become donut charts "
-        "and the rest become bar charts. Override any of these below — useful "
-        "for things like 'Month' where you might prefer a bar/trend view even "
-        "with few categories."
-    )
-    cols = st.columns(min(len(dims), 4))
-    for i, d in enumerate(dims):
-        with cols[i % len(cols)]:
-            choice = st.selectbox(
-                d,
-                options=["Auto", "Donut", "Bar"],
-                key=f"chart_type_{d}",
-            )
-            chart_types[d] = choice.lower()
-    st.markdown('</div>', unsafe_allow_html=True)
+def profile_columns(df):
+    """Return dimension/measure candidates + a suggested default dimension set."""
+    n = len(df)
+    dim_candidates, num_candidates, scored = [], [], []
 
-st.markdown('<div class="section-card">', unsafe_allow_html=True)
-st.markdown("### 3️⃣ Choose the measure (dependent variable)")
-measure_mode_label = st.radio(
-    "What should each summary table/chart measure?",
-    options=["Count of records", "Sum of a numeric column", "Average of a numeric column"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
+    id_pattern = r'\b(id|name|email|phone|contact|address|mrn|uid|url|date|time|no|number|code)\b'
 
-measure_col = None
-if measure_mode_label != "Count of records":
-    if not profile['numeric_candidates']:
-        st.warning("No numeric columns detected — falling back to Count of records.")
-        measure_mode_label = "Count of records"
-    else:
-        measure_col = st.selectbox("Numeric column", options=profile['numeric_candidates'])
+    for col in df.columns:
+        s = df[col]
+        nunique = s.nunique(dropna=True)
+        fill_rate = s.notna().sum() / n if n else 0
+        looks_like_id_name = bool(re.search(id_pattern, col.lower()))
+        looks_like_id_vals = nunique == n and n > 10
 
-measure_mode = {
-    "Count of records": "count",
-    "Sum of a numeric column": "sum",
-    "Average of a numeric column": "average",
-}[measure_mode_label]
-st.markdown('</div>', unsafe_allow_html=True)
+        if pd.api.types.is_numeric_dtype(s):
+            if not looks_like_id_name and not looks_like_id_vals:
+                num_candidates.append(col)
 
-st.markdown('<div class="section-card">', unsafe_allow_html=True)
-st.markdown("### 4️⃣ Title your dashboard")
-col_a, col_b = st.columns(2)
-title = col_a.text_input("Dashboard title", value="Auto-Generated Dashboard")
-source_label = col_b.text_input("Source label (optional)", value=uploaded.name)
-st.markdown('</div>', unsafe_allow_html=True)
+        is_long_text = False
+        if s.dtype == object or pd.api.types.is_string_dtype(s):
+            try:
+                avg_len = s.dropna().astype(str).str.len().mean()
+            except Exception:
+                avg_len = 0
+            is_long_text = bool(avg_len and avg_len > 30)
 
-# ----------------------------------------------------------------------
-# 3. Generate + interactive preview
-# ----------------------------------------------------------------------
-if not dims:
-    st.warning("Select at least one dimension column to continue.")
-    st.stop()
+        is_numeric = pd.api.types.is_numeric_dtype(s)
+        numeric_too_granular = is_numeric and nunique > 20
 
-generate = st.button("🚀 Generate Dashboard", type="primary", use_container_width=True)
+        looks_like_datetime_vals = False
+        if s.dtype == object or pd.api.types.is_string_dtype(s):
+            sample = s.dropna().astype(str)
+            if len(sample):
+                dt_re = re.compile(
+                    r'\d{1,2}\s*(?:am|pm)|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|'
+                    r'\d{1,2}[-\s](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', re.I)
+                match_frac = sample.str.contains(dt_re).mean()
+                looks_like_datetime_vals = match_frac > 0.3
 
-if generate:
-    with st.spinner("Building summary tables, charts and KPI cards..."):
-        try:
-            xlsx_bytes = build_workbook(
-                df, dims, measure_mode, measure_col,
-                title=title, source_label=source_label,
-                chart_types=chart_types,
-            )
-        except Exception as e:
-            st.error(f"Something went wrong while building the workbook: {e}")
-            st.stop()
+        if (2 <= nunique <= max(50, int(n * 0.6)) and not is_long_text
+                and not looks_like_id_vals and not looks_like_id_name
+                and not numeric_too_granular and not looks_like_datetime_vals
+                and fill_rate >= 0.3):
+            dim_candidates.append(col)
+            score = -nunique  # prefer fewer categories, but include long-tail too
+            scored.append((score, col))
 
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    st.markdown("### ✅ Output preview")
+    scored.sort(reverse=True, key=lambda t: t[0])
+    suggested = [c for _, c in scored[:6]]
 
-    # ---- live KPI preview (mirrors what the Excel KPI cards will show) ----
+    return {
+        'dimension_candidates': dim_candidates,
+        'numeric_candidates': num_candidates,
+        'suggested_dimensions': suggested,
+        'row_count': n,
+    }
+
+
+# ---------------------------------------------------------------------
+# Step 2 - chart helpers
+# ---------------------------------------------------------------------
+def _style_title(chart, text):
+    chart.title = text
+    try:
+        chart.title.tx.rich.p[0].r[0].rPr = CharacterProperties(sz=1200, b=True, solidFill=NAVY)
+    except Exception:
+        pass
+
+
+def _text_categories(sheet_name, col_letter, min_row, max_row, values):
+    """AxDataSource with strRef + cached strData, so charts render category
+    labels correctly even without an Excel refresh (and so they're typed as
+    text rather than openpyxl's default numRef, which is wrong for text)."""
+    ref = f"'{sheet_name}'!${col_letter}${min_row}:${col_letter}${max_row}"
+    cache = StrData(ptCount=len(values), pt=[StrVal(idx=i, v=str(v)) for i, v in enumerate(values)])
+    return AxDataSource(strRef=StrRef(f=ref, strCache=cache))
+
+
+def _num_values(sheet_name, col_letter, min_row, max_row, values):
+    """NumDataSource (numRef + cached numCache) for series values."""
+    ref = f"'{sheet_name}'!${col_letter}${min_row}:${col_letter}${max_row}"
+    cache = NumData(ptCount=len(values), pt=[NumVal(idx=i, v=v) for i, v in enumerate(values)])
+    return NumDataSource(numRef=NumRef(f=ref, numCache=cache))
+
+
+# ---------------------------------------------------------------------
+# Step 3 - build the workbook
+# ---------------------------------------------------------------------
+def build_workbook(df, dims, measure_mode, measure_col=None,
+                    title='Auto-Generated Dashboard', source_label='',
+                    chart_types=None):
+    """
+    df            : pandas DataFrame (already loaded)
+    dims          : list of column names to use as breakdown/category columns (1-8)
+    measure_mode  : 'count' | 'sum' | 'average'
+    measure_col   : numeric column name, required if measure_mode != 'count'
+    chart_types   : optional dict {dim_name: 'auto' | 'donut' | 'bar'}.
+                     'auto' (default) picks donut for <= DONUT_THRESHOLD
+                     categories and bar otherwise. Any dim not present in
+                     the dict is treated as 'auto'.
+
+    Returns: bytes of the .xlsx file
+    """
+    chart_types = chart_types or {}
+    if not dims:
+        raise ValueError('Select at least one dimension column.')
+    dims = dims[:MAX_DIMENSIONS]
+
+    df = clean_dataframe(df)
+    df = df.reset_index(drop=True)
+    n = len(df)
+    df[RECORD_COL] = 1
+    headers = list(df.columns)
+    ncols = len(headers)
+
+    for d in dims:
+        df[d] = df[d].apply(lambda v: BLANK if pd.isna(v) else str(v))
+
+    # -------- measure / aggregation setup --------
     if measure_mode == 'count':
-        agg_label, agg_fmt = "Records", "{:,.0f}"
-        def agg(d): return df[d].fillna(BLANK).astype(str).value_counts()
-        total_val = len(df)
-        total_label = "Total Records"
+        subtotal = 'count'
+        measure_label = 'Records'
+        numfmt = '#,##0'
+        sort_fn = lambda d: df[d].value_counts()
     elif measure_mode == 'sum':
-        agg_label, agg_fmt = f"Sum of {measure_col}", "{:,.2f}"
-        def agg(d): return df.assign(**{d: df[d].fillna(BLANK).astype(str)}).groupby(d)[measure_col].sum(min_count=1)
-        total_val = df[measure_col].sum()
-        total_label = f"Total {measure_col}"
+        if not measure_col:
+            raise ValueError('measure_col required for sum')
+        subtotal = 'sum'
+        measure_label = f'Sum of {measure_col}'
+        numfmt = '#,##0.00'
+        sort_fn = lambda d: df.groupby(d)[measure_col].sum(min_count=1)
     else:
-        agg_label, agg_fmt = f"Average {measure_col}", "{:,.2f}"
-        def agg(d): return df.assign(**{d: df[d].fillna(BLANK).astype(str)}).groupby(d)[measure_col].mean()
-        total_val = df[measure_col].mean()
-        total_label = f"Overall Average {measure_col}"
+        if not measure_col:
+            raise ValueError('measure_col required for average')
+        subtotal = 'average'
+        measure_label = f'Average {measure_col}'
+        numfmt = '#,##0.00'
+        sort_fn = lambda d: df.groupby(d)[measure_col].mean()
+
+    # -------- categorical ordering (Pareto: highest value first) --------
+    CAT_FIELDS = {}
+    CAT_VALUES = {}
+    GRAND_TOTAL = {}
+    for d in dims:
+        idx = headers.index(d)
+        ser = sort_fn(d).fillna(0).sort_values(ascending=False)
+        CAT_FIELDS[idx] = [str(v) for v in ser.index.tolist()]
+        CAT_VALUES[idx] = [float(v) for v in ser.tolist()]
+        if subtotal == 'sum':
+            GRAND_TOTAL[idx] = float(df[measure_col].sum())
+        elif subtotal == 'average':
+            GRAND_TOTAL[idx] = float(df[measure_col].mean())
+        else:
+            GRAND_TOTAL[idx] = float(n)
+
+    # -------- layout: where each dimension's summary table sits --------
+    summary_layout = {}  # dim -> (header_row, grand_row, n_items, fld_idx, caption_row)
+    running_row = 2
+    for d in dims:
+        idx = headers.index(d)
+        n_items = len(CAT_FIELDS[idx])
+        header_row = running_row + 1
+        grand_row = header_row + 1 + n_items
+        summary_layout[d] = (header_row, grand_row, n_items, idx, running_row)
+        running_row = grand_row + 2
+
+    # -------- workbook --------
+    wb = Workbook()
+    ws_data = wb.active
+    ws_data.title = 'Data'
+
+    header_fill = PatternFill('solid', start_color=NAVY)
+    header_font = Font(bold=True, color='FFFFFF', name='Calibri')
+    for j, h in enumerate(headers, start=1):
+        c = ws_data.cell(row=1, column=j, value=h)
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(wrap_text=True, vertical='center')
+
+    for i, (_, row) in enumerate(df.iterrows(), start=2):
+        for j, h in enumerate(headers, start=1):
+            val = row[h]
+            if pd.isna(val):
+                val = None
+            elif isinstance(val, (np.integer,)):
+                val = int(val)
+            elif isinstance(val, (np.floating,)):
+                val = float(val)
+            cell = ws_data.cell(row=i, column=j, value=val)
+            cell.font = Font(name='Calibri', size=10)
+            cell.alignment = Alignment(vertical='top')
+
+    last_col = get_column_letter(ncols)
+    tbl = Table(displayName='SourceData', ref=f'A1:{last_col}{n + 1}')
+    tbl.tableStyleInfo = TableStyleInfo(name='TableStyleMedium2', showFirstColumn=False,
+                                         showLastColumn=False, showRowStripes=True, showColumnStripes=False)
+    ws_data.add_table(tbl)
+    ws_data.freeze_panes = 'A2'
+    for j, h in enumerate(headers, start=1):
+        ws_data.column_dimensions[get_column_letter(j)].width = 22 if len(h) > 14 else 14
+    rc_idx = headers.index(RECORD_COL) + 1
+    ws_data.column_dimensions[get_column_letter(rc_idx)].hidden = True
+
+    # ---- Summary Data sheet (drives charts + KPI cards) ----
+    ws_sum = wb.create_sheet(SUMMARY_SHEET)
+    ws_sum.sheet_view.showGridLines = False
+    note = ws_sum.cell(row=1, column=1)
+    note.value = ('Summary tables behind every chart and KPI on the Dashboard. '
+                   'Want to slice the raw data yourself? Go to the Data sheet, '
+                   'click inside the table, then Insert \u2192 PivotTable.')
+    note.font = Font(name='Calibri', size=11, italic=True, color=NAVY)
+    note.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+    ws_sum.merge_cells(start_row=1, start_column=1, end_row=1, end_column=12)
+    ws_sum.row_dimensions[1].height = 36
+    for cell in ws_sum['A1:L1'][0]:
+        cell.fill = PatternFill('solid', start_color=LIGHT)
+
+    for d in dims:
+        h, g, n_items, idx, caption_row = summary_layout[d]
+        cap = ws_sum.cell(row=caption_row, column=1)
+        cap.value = d
+        cap.font = Font(name='Calibri', size=12, bold=True, color=NAVY)
+
+        hdr1 = ws_sum.cell(row=h, column=1, value=d)
+        hdr2 = ws_sum.cell(row=h, column=2, value=measure_label)
+        for cell in (hdr1, hdr2):
+            cell.font = Font(name='Calibri', bold=True, color='FFFFFF')
+            cell.fill = PatternFill('solid', start_color=NAVY)
+        for k in range(n_items):
+            lc = ws_sum.cell(row=h + 1 + k, column=1, value=CAT_FIELDS[idx][k])
+            vc = ws_sum.cell(row=h + 1 + k, column=2, value=CAT_VALUES[idx][k])
+            vc.number_format = numfmt
+        glc = ws_sum.cell(row=g, column=1, value='Grand Total')
+        gvc = ws_sum.cell(row=g, column=2, value=GRAND_TOTAL[idx])
+        glc.font = Font(bold=True)
+        gvc.font = Font(bold=True)
+        gvc.number_format = numfmt
+
+    ws_sum.column_dimensions['A'].width = 28
+    ws_sum.column_dimensions['B'].width = 16
+
+    # ---- Dashboard sheet ----
+    ws_dash = wb.create_sheet('Dashboard', 0)
+    _build_dashboard(ws_dash, ws_sum, dims, headers, CAT_FIELDS, CAT_VALUES, summary_layout,
+                      measure_mode, measure_col, measure_label, numfmt, title, source_label, n,
+                      chart_types)
+
+    wb._sheets = [wb['Dashboard'], wb[SUMMARY_SHEET], wb['Data']]
+    wb.active = 0
+
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.read()
+
+
+# ---------------------------------------------------------------------
+# Step 4 - Dashboard sheet (branding + KPI cards + charts)
+# ---------------------------------------------------------------------
+def _build_dashboard(ws, ws_sum, dims, headers, CAT_FIELDS, CAT_VALUES, summary_layout,
+                       measure_mode, measure_col, measure_label, numfmt, title, source_label, n,
+                       chart_types=None):
+    chart_types = chart_types or {}
+    ws.sheet_view.showGridLines = False
+    ws.sheet_view.zoomScale = 85
+    ws.page_setup.orientation = 'landscape'
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+
+    n_dims = len(dims)
+    n_cols_layout = max(24, (min(n_dims, 6) * 3) or 18)
+    last_col_letter = get_column_letter(n_cols_layout)
+
+    # ---------------- Title band ----------------
+    ws.merge_cells(f'A1:{get_column_letter(n_cols_layout - 6)}2')
+    c = ws['A1']
+    c.value = title
+    c.font = Font(name='Calibri', size=22, bold=True, color='FFFFFF')
+    c.alignment = Alignment(horizontal='left', vertical='center', indent=1)
+    for row in ws[f'A1:{last_col_letter}2']:
+        for cell in row:
+            cell.fill = PatternFill('solid', start_color=NAVY)
+
+    # OMAC branding capsule, top-right of the title band
+    badge_c0 = n_cols_layout - 5
+    ws.merge_cells(start_row=1, start_column=badge_c0, end_row=1, end_column=n_cols_layout)
+    b = ws.cell(row=1, column=badge_c0)
+    b.value = BRAND
+    b.font = Font(name='Calibri', size=10, bold=True, color=NAVY)
+    b.fill = PatternFill('solid', start_color=GOLD)
+    b.alignment = Alignment(horizontal='center', vertical='center')
+    ws.merge_cells(start_row=2, start_column=badge_c0, end_row=2, end_column=n_cols_layout)
+    b2 = ws.cell(row=2, column=badge_c0)
+    b2.value = 'Auto-Generated Dashboard'
+    b2.font = Font(name='Calibri', size=8, italic=True, color='FFFFFF')
+    b2.alignment = Alignment(horizontal='center', vertical='center')
+
+    ws.merge_cells(f'A3:{last_col_letter}3')
+    c = ws['A3']
+    subtitle = f'{n:,} records'
+    if source_label:
+        subtitle = f'{source_label}  |  {subtitle}'
+    c.value = subtitle
+    c.font = Font(name='Calibri', size=11, italic=True, color=GREY)
+    c.alignment = Alignment(horizontal='left', vertical='center', indent=1)
+
+    # ---------------- KPI cards ----------------
+    if measure_mode == 'count':
+        kpi1_label = 'Total Records'
+    elif measure_mode == 'sum':
+        kpi1_label = f'Total {measure_col}'
+    else:
+        kpi1_label = f'Overall Average {measure_col}'
 
     d0 = dims[0]
-    s0 = agg(d0).fillna(0).sort_values(ascending=False)
+    h0, g0, n0, idx0, _ = summary_layout[d0]
+    SD = SUMMARY_SHEET
+    grand_addr0 = f"'{SD}'!B{g0}"
+    top_label_addr0 = f"'{SD}'!A{h0 + 1}"
+    top_val_addr0 = f"'{SD}'!B{h0 + 1}"
+    second_label_addr0 = f"'{SD}'!A{h0 + 2}" if n0 >= 2 else top_label_addr0
+    second_val_addr0 = f"'{SD}'!B{h0 + 2}" if n0 >= 2 else top_val_addr0
+    cat_count_formula = f"COUNTA('{SD}'!A{h0 + 1}:A{h0 + n0})"
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric(total_label, agg_fmt.format(total_val))
-    k2.metric(f"Top {d0}", str(s0.index[0]))
-    k3.metric(f"{agg_label} ({d0} top)", agg_fmt.format(s0.iloc[0]))
-    k4.metric(f"{d0} categories", f"{len(s0)}")
+    kpis = [
+        (kpi1_label, f'={grand_addr0}', numfmt, NAVY),
+        (f'Top {d0}', f'={top_label_addr0}', '@', TEAL, True),
+        (f'{measure_label} ({d0} top)', f'={top_val_addr0}', numfmt, TEAL),
+    ]
 
-    st.caption("Charts below mirror the charts in the generated workbook "
-               "(top categories shown):")
+    if len(dims) >= 2:
+        d1 = dims[1]
+        h1, g1, n1, idx1, _ = summary_layout[d1]
+        kpis.append((f'Top {d1}', f"='{SD}'!A{h1 + 1}", '@', ACCENT, True))
+        kpis.append((f'{measure_label} ({d1} top)', f"='{SD}'!B{h1 + 1}", numfmt, ACCENT))
+    else:
+        kpis.append((f'2nd Highest {d0}', f'={second_label_addr0}', '@', ACCENT, True))
+        kpis.append((f'{measure_label} (2nd)', f'={second_val_addr0}', numfmt, ACCENT))
 
-    chart_cols = st.columns(3)
+    kpis.append((f'{d0} Categories', f'={cat_count_formula}', '#,##0', GREY))
+
+    card_width = 3
+    start_row = 5
+    end_row = 8
+    thin = Side(style='thin', color='D0D0D0')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for idx, kpi in enumerate(kpis[:6]):
+        label, formula, fmt, color = kpi[0], kpi[1], kpi[2], kpi[3]
+        is_text = len(kpi) > 4 and kpi[4]
+        c0 = idx * card_width + 1
+        c1 = c0 + card_width - 1
+        rng_label = f'{get_column_letter(c0)}{start_row}:{get_column_letter(c1)}{start_row}'
+        rng_value = f'{get_column_letter(c0)}{start_row + 1}:{get_column_letter(c1)}{end_row - 1}'
+        ws.merge_cells(rng_label)
+        ws.merge_cells(rng_value)
+        lab = ws.cell(row=start_row, column=c0, value=label.upper())
+        lab.font = Font(name='Calibri', size=9, bold=True, color=GREY)
+        lab.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        val = ws.cell(row=start_row + 1, column=c0, value=formula)
+        val.font = Font(name='Calibri', size=20 if is_text else 24, bold=True, color=color)
+        if fmt != '@':
+            val.number_format = fmt
+        val.alignment = Alignment(horizontal='center', vertical='center', wrap_text=is_text)
+        for r in range(start_row, end_row + 1):
+            for col in range(c0, c1 + 1):
+                cell = ws.cell(row=r, column=col)
+                cell.border = border
+                cell.fill = PatternFill('solid', start_color=LIGHT if r == start_row else 'FFFFFF')
+
+    # ---------------- Charts: top-N chart, plus an "all categories" chart underneath ----------------
+    anchor_cols_idx = [1, 14]       # column A and N
+    ROW_CM = 0.529  # approx cm per default row height
+
+    row_cursor = 10
+    row_group_height = 0
     for i, d in enumerate(dims):
-        s = agg(d).fillna(0).sort_values(ascending=False).head(10)
-        with chart_cols[i % 3]:
-            st.markdown(f"**{d}**")
-            st.bar_chart(s)
+        h, g, n_items, idx, _ = summary_layout[d]
+        col_idx = i % 2
+        if col_idx == 0 and i > 0:
+            row_cursor += row_group_height + 2
+            row_group_height = 0
+        c0 = anchor_cols_idx[col_idx]
+        anchor = f'{get_column_letter(c0)}{row_cursor}'
 
-    st.markdown('</div>', unsafe_allow_html=True)
+        choice = chart_types.get(d, 'auto')
+        if choice == 'donut':
+            use_donut = True
+        elif choice == 'bar':
+            use_donut = False
+        else:
+            use_donut = n_items <= DONUT_THRESHOLD
 
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    st.markdown("### ⬇️ Download")
-    st.download_button(
-        "Download Dashboard.xlsx",
-        data=xlsx_bytes,
-        file_name="Dashboard.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-        use_container_width=True,
-    )
+        top_n = min(n_items, MAX_CHART_CATEGORIES)
 
-    with st.expander("📌 About the downloaded workbook", expanded=True):
-        st.markdown("""
-The workbook has 3 sheets: **Dashboard** (KPI cards + charts), **Summary
-Data** (the per-category tables that drive every chart and KPI on the
-Dashboard), and **Data** (cleaned source as an Excel Table).
+        if use_donut:
+            chart = DoughnutChart()
+            chart.add_data(Reference(ws_sum, min_col=2, min_row=h, max_row=h + top_n), titles_from_data=True)
+            chart.height = 8
+            chart.width = 9.5
+            chart.dataLabels = DataLabelList(showVal=True, showCatName=False, showSerName=False,
+                                              showPercent=False, showLegendKey=False)
+            chart.holeSize = 55
+            title_text = f'{d}  (top {top_n} of {n_items})' if n_items > top_n else d
+            _style_title(chart, title_text)
+            chart.series[0].cat = _text_categories(ws_sum.title, 'A', h + 1, h + top_n, CAT_FIELDS[idx][:top_n])
+            chart.series[0].val = _num_values(ws_sum.title, 'B', h + 1, h + top_n, CAT_VALUES[idx][:top_n])
+            chart.series[0].dPt = [
+                DataPoint(idx=k, spPr=GraphicalProperties(solidFill=PALETTE[k % len(PALETTE)]))
+                for k in range(top_n)
+            ]
+            chart_height_rows = 16
+        else:
+            chart = BarChart()
+            chart.type = 'bar'
+            chart.add_data(Reference(ws_sum, min_col=2, min_row=h + 1, max_row=h + top_n), titles_from_data=False)
+            chart.height = 9.5
+            chart.width = 12.5
+            chart.dataLabels = DataLabelList(showVal=True, showCatName=False, showSerName=False,
+                                              showPercent=False, showLegendKey=False)
+            chart.series[0].cat = _text_categories(ws_sum.title, 'A', h + 1, h + top_n, CAT_FIELDS[idx][:top_n])
+            chart.series[0].val = _num_values(ws_sum.title, 'B', h + 1, h + top_n, CAT_VALUES[idx][:top_n])
+            chart.series[0].graphicalProperties = GraphicalProperties(solidFill=PALETTE[i % len(PALETTE)])
+            chart.x_axis.axPos = 'l'
+            chart.y_axis.axPos = 'b'
+            chart.x_axis.delete = False
+            chart.y_axis.delete = False
+            chart.x_axis.tickLblPos = 'nextTo'
+            chart.y_axis.tickLblPos = 'nextTo'
+            chart.x_axis.crosses = 'autoZero'
+            chart.y_axis.crosses = 'autoZero'
+            chart.y_axis.majorGridlines = None
+            chart.legend = None
+            title_text = f'{d}  (top {top_n} of {n_items})' if n_items > top_n else d
+            _style_title(chart, title_text)
+            chart_height_rows = 19
 
-This file opens cleanly in Excel with no "repair" prompts. If you'd like
-to explore the raw data interactively yourself:
+        ws.add_chart(chart, anchor)
+        pair_height = chart_height_rows
 
-1. Go to the **Data** sheet and click anywhere inside the table.
-2. **Insert → PivotTable** and choose where to place it.
-3. Drag any field into Rows/Values to build your own pivot — Excel will
-   create a fresh, valid PivotTable from this table.
+        # ---- second chart: ALL categories, directly underneath ----
+        if n_items > top_n:
+            all_height_cm = max(9.5, n_items * 0.35 + 2)
+            all_height_rows = int(all_height_cm / ROW_CM) + 1
+            anchor2_row = row_cursor + chart_height_rows + 1
+            anchor2 = f'{get_column_letter(c0)}{anchor2_row}'
 
-For interactive, slicer-style filtering without leaving the browser, use
-this app's own charts and KPI preview above — they update live as you
-change your dimension/measure selections.
-        """)
-    st.markdown('</div>', unsafe_allow_html=True)
+            chart_all = BarChart()
+            chart_all.type = 'bar'
+            chart_all.add_data(Reference(ws_sum, min_col=2, min_row=h + 1, max_row=h + n_items), titles_from_data=False)
+            chart_all.height = all_height_cm
+            chart_all.width = 12.5
+            chart_all.dataLabels = DataLabelList(showVal=True, showCatName=False, showSerName=False,
+                                                  showPercent=False, showLegendKey=False)
+            chart_all.series[0].cat = _text_categories(ws_sum.title, 'A', h + 1, h + n_items, CAT_FIELDS[idx][:n_items])
+            chart_all.series[0].val = _num_values(ws_sum.title, 'B', h + 1, h + n_items, CAT_VALUES[idx][:n_items])
+            chart_all.series[0].graphicalProperties = GraphicalProperties(solidFill=PALETTE[(i + 1) % len(PALETTE)])
+            chart_all.x_axis.axPos = 'l'
+            chart_all.y_axis.axPos = 'b'
+            chart_all.x_axis.delete = False
+            chart_all.y_axis.delete = False
+            chart_all.x_axis.tickLblPos = 'nextTo'
+            chart_all.y_axis.tickLblPos = 'nextTo'
+            chart_all.x_axis.crosses = 'autoZero'
+            chart_all.y_axis.crosses = 'autoZero'
+            chart_all.y_axis.majorGridlines = None
+            chart_all.legend = None
+            _style_title(chart_all, f'{d}  (all {n_items} categories)')
 
-st.markdown(f"""
-<div class="omac-footer">
-    Built for healthcare quality &amp; analytics teams<br>
-    <span class="pill">{BRAND}</span>
-</div>
-""", unsafe_allow_html=True)
+            ws.add_chart(chart_all, anchor2)
+            pair_height += 1 + all_height_rows
+
+        row_group_height = max(row_group_height, pair_height)
+
+    # ---------------- Column widths / row heights ----------------
+    for col in range(1, n_cols_layout + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 8.5
+    ws.row_dimensions[1].height = 28
+    ws.row_dimensions[2].height = 28
+    ws.row_dimensions[3].height = 18
+    for r in range(5, 9):
+        ws.row_dimensions[r].height = 22
